@@ -740,6 +740,7 @@ impl ApiServer {
     let api_for_v1 = api.clone();
     let app = Router::new()
       .merge(v1_routes)
+      .merge(crate::worker::worker_routes())
       .route("/openapi.json", get(move || async move { Json(api) }))
       .route(
         "/v1/openapi.json",
