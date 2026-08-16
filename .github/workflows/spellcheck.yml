@@ -1,0 +1,26 @@
+name: Spell Check
+
+permissions:
+  contents: read
+
+on:
+  workflow_call: {}
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  CLICOLOR: 1
+
+jobs:
+  spelling:
+    name: Spell Check with Typos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Actions Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+      - name: Spell Check Repo
+        uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 #v1.48.0

@@ -1,0 +1,333 @@
+use directories::BaseDirs;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static BASE_DIRS: OnceLock<BaseDirs> = OnceLock::new();
+static PORTABLE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn base_dirs() -> &'static BaseDirs {
+  BASE_DIRS.get_or_init(|| BaseDirs::new().expect("Failed to get base directories"))
+}
+
+/// Returns the portable base directory if a `.portable` marker exists next to the executable.
+fn portable_dir() -> Option<&'static PathBuf> {
+  PORTABLE_DIR
+    .get_or_init(|| {
+      std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .filter(|dir| dir.join(".portable").exists())
+    })
+    .as_ref()
+}
+
+/// Returns true if the app is running in portable mode.
+pub fn is_portable() -> bool {
+  portable_dir().is_some()
+}
+
+/// Optional single-root override for all on-disk state. Set
+/// `DONUTBROWSER_DATA_ROOT=/path` (e.g. a tmpfs mount) to relocate
+/// data/cache/logs under `<root>/{data,cache,logs}` without touching the real
+/// dev/prod directories. The more specific `DONUTBROWSER_DATA_DIR` /
+/// `DONUTBROWSER_CACHE_DIR` overrides still take precedence over this.
+fn data_root() -> Option<PathBuf> {
+  std::env::var_os("DONUTBROWSER_DATA_ROOT")
+    .filter(|v| !v.is_empty())
+    .map(PathBuf::from)
+}
+
+/// Log directory when `DONUTBROWSER_DATA_ROOT` is set (`<root>/logs`); `None`
+/// otherwise, in which case the platform default app log dir is used.
+pub fn log_dir_override() -> Option<PathBuf> {
+  data_root().map(|root| root.join("logs"))
+}
+
+pub fn app_name() -> &'static str {
+  if cfg!(debug_assertions) {
+    "DonutBrowserDev"
+  } else {
+    "DonutBrowser"
+  }
+}
+
+pub fn data_dir() -> PathBuf {
+  #[cfg(test)]
+  {
+    if let Some(dir) = TEST_DATA_DIR.with(|cell| cell.borrow().clone()) {
+      return dir;
+    }
+  }
+
+  if let Ok(dir) = std::env::var("DONUTBROWSER_DATA_DIR") {
+    return PathBuf::from(dir);
+  }
+
+  if let Some(root) = data_root() {
+    return root.join("data");
+  }
+
+  if let Some(dir) = portable_dir() {
+    return dir.join("data");
+  }
+
+  base_dirs().data_local_dir().join(app_name())
+}
+
+pub fn cache_dir() -> PathBuf {
+  #[cfg(test)]
+  {
+    if let Some(dir) = TEST_CACHE_DIR.with(|cell| cell.borrow().clone()) {
+      return dir;
+    }
+  }
+
+  if let Ok(dir) = std::env::var("DONUTBROWSER_CACHE_DIR") {
+    return PathBuf::from(dir);
+  }
+
+  if let Some(root) = data_root() {
+    return root.join("cache");
+  }
+
+  if let Some(dir) = portable_dir() {
+    return dir.join("cache");
+  }
+
+  base_dirs().cache_dir().join(app_name())
+}
+
+pub fn profiles_dir() -> PathBuf {
+  data_dir().join("profiles")
+}
+
+pub fn binaries_dir() -> PathBuf {
+  data_dir().join("binaries")
+}
+
+pub fn data_subdir() -> PathBuf {
+  data_dir().join("data")
+}
+
+pub fn settings_dir() -> PathBuf {
+  data_dir().join("settings")
+}
+
+pub fn proxies_dir() -> PathBuf {
+  data_dir().join("proxies")
+}
+
+pub fn proxy_workers_dir() -> PathBuf {
+  cache_dir().join("proxy_workers")
+}
+
+pub fn vpn_dir() -> PathBuf {
+  data_dir().join("vpn")
+}
+
+pub fn extensions_dir() -> PathBuf {
+  data_dir().join("extensions")
+}
+
+/// Unpacked extensions that ship with the app itself, kept separate from
+/// `extensions_dir()/unpacked` because that one is wiped on every profile
+/// launch.
+pub fn bundled_extensions_dir() -> PathBuf {
+  data_dir().join("bundled-extensions")
+}
+
+pub fn dns_blocklist_dir() -> PathBuf {
+  cache_dir().join("dns_blocklists")
+}
+
+/// Resolve the directory that tauri-plugin-log writes to. Mirrors the
+/// `LogDir` target used in the plugin builder so the path matches what's
+/// actually on disk for this OS.
+pub fn log_dir<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> PathBuf {
+  if let Some(dir) = log_dir_override() {
+    return dir;
+  }
+  use tauri::Manager;
+  handle
+    .path()
+    .app_log_dir()
+    .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+#[cfg(test)]
+thread_local! {
+  static TEST_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+  static TEST_CACHE_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub struct TestDirGuard {
+  kind: TestDirKind,
+}
+
+#[cfg(test)]
+enum TestDirKind {
+  Data,
+  Cache,
+}
+
+#[cfg(test)]
+impl Drop for TestDirGuard {
+  fn drop(&mut self) {
+    match self.kind {
+      TestDirKind::Data => TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = None),
+      TestDirKind::Cache => TEST_CACHE_DIR.with(|cell| *cell.borrow_mut() = None),
+    }
+  }
+}
+
+#[cfg(test)]
+pub fn set_test_data_dir(dir: PathBuf) -> TestDirGuard {
+  TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = Some(dir));
+  TestDirGuard {
+    kind: TestDirKind::Data,
+  }
+}
+
+#[cfg(test)]
+pub fn set_test_cache_dir(dir: PathBuf) -> TestDirGuard {
+  TEST_CACHE_DIR.with(|cell| *cell.borrow_mut() = Some(dir));
+  TestDirGuard {
+    kind: TestDirKind::Cache,
+  }
+}
+
+/// Restrict a just-written file to owner-only read/write (`0600`) on Unix so
+/// other local users/processes can't read secret material (tokens, E2E
+/// password, encrypted vault files). Best-effort: the write already succeeded,
+/// so a permission failure is logged, not propagated. On Windows the per-user
+/// profile ACL already restricts access, so this is a no-op there.
+pub fn restrict_to_owner(path: &std::path::Path) {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+      log::warn!("Failed to restrict permissions on {}: {e}", path.display());
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = path;
+  }
+}
+
+/// Write sensitive data without creating a wider-permission file first.
+pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+  if path.exists() {
+    restrict_to_owner(path);
+  }
+  let mut options = std::fs::OpenOptions::new();
+  options.create(true).truncate(true).write(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+  }
+  let file = options.open(path)?;
+  restrict_to_owner(path);
+  Ok(file)
+}
+
+pub fn write_owner_only(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+  use std::io::Write;
+  let mut file = create_owner_only(path)?;
+  file.write_all(content)?;
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_app_name() {
+    let name = app_name();
+    assert!(
+      name == "DonutBrowser" || name == "DonutBrowserDev",
+      "app_name should be DonutBrowser or DonutBrowserDev, got: {name}"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn owner_only_writer_uses_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("secret.json");
+    write_owner_only(&path, b"secret").unwrap();
+    assert_eq!(
+      std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+  }
+
+  #[test]
+  fn test_data_dir_returns_path() {
+    let dir = data_dir();
+    assert!(
+      dir.to_string_lossy().contains(app_name()),
+      "data_dir should contain app_name"
+    );
+  }
+
+  #[test]
+  fn test_cache_dir_returns_path() {
+    let dir = cache_dir();
+    assert!(
+      dir.to_string_lossy().contains(app_name()),
+      "cache_dir should contain app_name"
+    );
+  }
+
+  #[test]
+  fn test_subdirectory_helpers() {
+    assert!(profiles_dir().ends_with("profiles"));
+    assert!(binaries_dir().ends_with("binaries"));
+    assert!(data_subdir().ends_with("data"));
+    assert!(settings_dir().ends_with("settings"));
+    assert!(proxies_dir().ends_with("proxies"));
+    assert!(proxy_workers_dir().ends_with("proxy_workers"));
+    assert!(vpn_dir().ends_with("vpn"));
+    assert!(extensions_dir().ends_with("extensions"));
+    assert!(dns_blocklist_dir().ends_with("dns_blocklists"));
+  }
+
+  #[test]
+  fn test_set_test_data_dir() {
+    let tmp = PathBuf::from("/tmp/test-donut-data");
+    let _guard = set_test_data_dir(tmp.clone());
+    assert_eq!(data_dir(), tmp);
+    assert_eq!(profiles_dir(), tmp.join("profiles"));
+    assert_eq!(binaries_dir(), tmp.join("binaries"));
+  }
+
+  #[test]
+  fn test_set_test_cache_dir() {
+    let tmp = PathBuf::from("/tmp/test-donut-cache");
+    let _guard = set_test_cache_dir(tmp.clone());
+    assert_eq!(cache_dir(), tmp);
+  }
+
+  #[test]
+  fn test_guard_cleanup() {
+    let original_data = data_dir();
+    let original_cache = cache_dir();
+
+    {
+      let _guard = set_test_data_dir(PathBuf::from("/tmp/test-cleanup-data"));
+      assert_eq!(data_dir(), PathBuf::from("/tmp/test-cleanup-data"));
+    }
+    assert_eq!(data_dir(), original_data);
+
+    {
+      let _guard = set_test_cache_dir(PathBuf::from("/tmp/test-cleanup-cache"));
+      assert_eq!(cache_dir(), PathBuf::from("/tmp/test-cleanup-cache"));
+    }
+    assert_eq!(cache_dir(), original_cache);
+  }
+}

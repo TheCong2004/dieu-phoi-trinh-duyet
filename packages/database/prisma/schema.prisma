@@ -1,0 +1,127 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+  SELLER
+}
+
+model User {
+  id           String          @id @default(uuid())
+  email        String          @unique
+  passwordHash String
+  role         Role            @default(USER)
+  workspaces   TeamWorkspace[]
+  createdWorkflows Workflow[]  @relation("AuthorWorkflows")
+  licenses     License[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  deletedAt    DateTime?
+
+  @@index([email])
+}
+
+model TeamWorkspace {
+  id        String           @id @default(uuid())
+  name      String
+  ownerId   String
+  owner     User             @relation(fields: [ownerId], references: [id])
+  profiles  BrowserProfile[]
+  workflows Workflow[]
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  deletedAt DateTime?
+
+  @@index([ownerId])
+}
+
+model BrowserProfile {
+  id          String        @id @default(uuid())
+  workspaceId String
+  workspace   TeamWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  fingerprint Json
+  proxyConfig Json?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  deletedAt   DateTime?
+
+  @@index([workspaceId])
+}
+
+model Workflow {
+  id          String            @id @default(uuid())
+  workspaceId String
+  workspace   TeamWorkspace     @relation(fields: [workspaceId], references: [id])
+  authorId    String
+  author      User              @relation("AuthorWorkflows", fields: [authorId], references: [id])
+  title       String
+  description String?
+  versions    WorkflowVersion[]
+  listings    MarketplaceListing[]
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  deletedAt   DateTime?
+
+  @@index([workspaceId, authorId])
+}
+
+model WorkflowVersion {
+  id               String   @id @default(uuid())
+  workflowId       String
+  workflow         Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  version          String
+  flowiseGraphJson Json
+  compiledOpcodeJson Json
+  encryptedPackage Bytes
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([workflowId, version])
+}
+
+model License {
+  id           String    @id @default(uuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id])
+  key          String    @unique
+  deviceLimit  Int       @default(1)
+  expiresAt    DateTime?
+  devices      DeviceBinding[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([key, userId])
+}
+
+model DeviceBinding {
+  id           String   @id @default(uuid())
+  licenseId    String
+  license      License  @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  hardwareUuid String   @unique
+  deviceName   String
+  boundAt      DateTime @default(now())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([licenseId, hardwareUuid])
+}
+
+model MarketplaceListing {
+  id          String   @id @default(uuid())
+  workflowId  String
+  workflow    Workflow @relation(fields: [workflowId], references: [id])
+  priceCents  Int
+  rating      Float    @default(5.0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([workflowId])
+}
