@@ -1948,9 +1948,14 @@ pub fn run_with_builder(
                 Ok(handshake) => {
                   let _ = crate::worker::WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
                 }
-                Err(_) => {
-                  // Extension disconnected or tab closed -> transition to Reconciling
-                  let _ = crate::worker::WORKER_REGISTRY.reconcile_worker(&worker_id, false, false, None).await;
+                Err(err) => {
+                  if err.is_transient() {
+                    // Transient error (timeout, closed tab, bridge restart) -> Reconciling (allows retry)
+                    let _ = crate::worker::WORKER_REGISTRY.reconcile_worker(&worker_id, false, false, None).await;
+                  } else {
+                    // Fatal identity / protocol mismatch -> Error
+                    let _ = crate::worker::WORKER_REGISTRY.mark_worker_error(&worker_id, err.message).await;
+                  }
                 }
               }
             }

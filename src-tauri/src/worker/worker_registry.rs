@@ -122,6 +122,20 @@ impl WorkerRegistry {
     Ok(())
   }
 
+  /// Mark a worker as fatal error upon non-transient mismatch.
+  pub async fn mark_worker_error(&self, worker_id: &str, error_msg: String) -> Result<(), WorkerError> {
+    let mut state = self.state.lock().await;
+    if let Some(worker) = state
+      .workers
+      .get_mut(worker_id)
+      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
+    {
+      worker.state = WorkerState::Error;
+      worker.last_error = Some(error_msg);
+    }
+    Ok(())
+  }
+
   /// Sync known profiles at daemon startup.
   pub async fn sync_startup_profiles(&self, profiles: &[crate::profile::types::BrowserProfile]) {
     let mut state = self.state.lock().await;
@@ -219,10 +233,17 @@ impl WorkerRegistry {
 
     if !req.logged_in {
       worker.state = WorkerState::LoginRequired;
+    } else if worker.current_lease_id.is_some() {
+      // Active lease authority wins: Worker remains Leased/Busy regardless of whether extension reports IDLE or BUSY
+      worker.state = if req.worker_state == "BUSY" {
+        WorkerState::Busy
+      } else {
+        WorkerState::Leased
+      };
     } else if req.worker_state == "BUSY" || req.worker_state == "LEASED" {
       worker.state = WorkerState::Busy;
-    } else if req.worker_state == "IDLE" && worker.current_lease_id.is_none() {
-      // Safe Automatic Reconciliation: Transition to Ready ONLY when extension is strictly IDLE and has no active lease
+    } else if req.worker_state == "IDLE" {
+      // Safe Automatic Reconciliation: Transition to Ready ONLY when extension is strictly IDLE and has NO active lease
       worker.state = WorkerState::Ready;
     } else if req.worker_state == "STARTING" || req.worker_state == "RECONCILING" {
       worker.state = WorkerState::Reconciling;
@@ -231,6 +252,52 @@ impl WorkerRegistry {
     }
 
     Ok(())
+  }
+
+  /// Reconciles a worker's state upon health probe or background monitor.
+  /// Transient failures keep the worker in Reconciling so background probes continue retrying.
+  pub async fn reconcile_worker(
+    &self,
+    worker_id: &str,
+    is_idle: bool,
+    is_healthy: bool,
+    grok_logged_in: Option<bool>,
+  ) -> Result<WorkerState, WorkerError> {
+    let mut state = self.state.lock().await;
+
+    let worker = state
+      .workers
+      .get_mut(worker_id)
+      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
+      .ok_or_else(|| {
+        WorkerError::new(
+          WorkerErrorCode::NoAvailableWorker,
+          format!("Worker '{worker_id}' not found in registry"),
+        )
+      })?;
+
+    if let Some(logged_in) = grok_logged_in {
+      worker.grok_logged_in = Some(logged_in);
+    }
+
+    if !is_healthy {
+      // Transient failure -> Move to Reconciling (NOT permanent Error) so background loop retries
+      worker.state = WorkerState::Reconciling;
+      return Ok(WorkerState::Reconciling);
+    }
+
+    if worker.current_lease_id.is_some() {
+      // Active lease wins -> remain Leased/Busy
+      worker.state = if is_idle { WorkerState::Leased } else { WorkerState::Busy };
+    } else if worker.grok_logged_in == Some(false) {
+      worker.state = WorkerState::LoginRequired;
+    } else if is_idle {
+      worker.state = WorkerState::Ready;
+    } else {
+      worker.state = WorkerState::Busy;
+    }
+
+    Ok(worker.state.clone())
   }
 
   /// Atomically acquires an exclusive worker lease for a specific step attempt.

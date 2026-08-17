@@ -37,6 +37,8 @@ pub enum WorkerErrorCode {
   WorkerReconciling,
   WorkerRegistryInitializing,
   BridgeDisconnected,
+  BridgeTimeout,
+  ExtensionContextNotFound,
   GrokPageNotReady,
   GrokTargetAmbiguous,
   InvalidHealthResponse,
@@ -57,6 +59,18 @@ impl WorkerError {
     }
   }
 
+  pub fn is_transient(&self) -> bool {
+    matches!(
+      self.code,
+      WorkerErrorCode::BridgeDisconnected
+        | WorkerErrorCode::BridgeTimeout
+        | WorkerErrorCode::ExtensionContextNotFound
+        | WorkerErrorCode::GrokPageNotReady
+        | WorkerErrorCode::WorkerReconciling
+        | WorkerErrorCode::GrokTargetAmbiguous
+    )
+  }
+
   pub fn status_code(&self) -> u16 {
     match self.code {
       WorkerErrorCode::PoolNotFound | WorkerErrorCode::LeaseNotFound => 404,
@@ -70,8 +84,10 @@ impl WorkerError {
       | WorkerErrorCode::ProtocolMismatch
       | WorkerErrorCode::InvalidProfile => 400,
       WorkerErrorCode::InvalidHealthResponse => 502,
+      WorkerErrorCode::BridgeTimeout => 504,
       WorkerErrorCode::WorkerRegistryInitializing
       | WorkerErrorCode::BridgeDisconnected
+      | WorkerErrorCode::ExtensionContextNotFound
       | WorkerErrorCode::GrokPageNotReady => 503,
       WorkerErrorCode::Internal => 500,
     }
@@ -91,6 +107,8 @@ impl WorkerError {
       WorkerErrorCode::WorkerReconciling => "WORKER_RECONCILING",
       WorkerErrorCode::WorkerRegistryInitializing => "WORKER_REGISTRY_INITIALIZING",
       WorkerErrorCode::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+      WorkerErrorCode::BridgeTimeout => "BRIDGE_TIMEOUT",
+      WorkerErrorCode::ExtensionContextNotFound => "EXTENSION_CONTEXT_NOT_FOUND",
       WorkerErrorCode::GrokPageNotReady => "GROK_PAGE_NOT_READY",
       WorkerErrorCode::GrokTargetAmbiguous => "GROK_TARGET_AMBIGUOUS",
       WorkerErrorCode::InvalidHealthResponse => "INVALID_HEALTH_RESPONSE",

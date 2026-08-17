@@ -8,6 +8,7 @@ use axum::{
   Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -163,16 +164,15 @@ async fn send_cdp_evaluate(
   ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
   cmd_id: u64,
   expression: &str,
-  context_id: Option<i64>,
+  context_id: i64,
+  timeout_dur: Duration,
 ) -> Result<serde_json::Value, WorkerError> {
-  let mut params = serde_json::json!({
+  let params = serde_json::json!({
     "expression": expression,
     "awaitPromise": true,
-    "returnByValue": true
+    "returnByValue": true,
+    "contextId": context_id
   });
-  if let Some(cid) = context_id {
-    params["contextId"] = serde_json::json!(cid);
-  }
 
   let cdp_req = serde_json::json!({
     "id": cmd_id,
@@ -185,56 +185,67 @@ async fn send_cdp_evaluate(
     .await
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to send CDP evaluate: {e}")))?;
 
-  while let Some(msg) = ws_stream.next().await {
-    match msg {
-      Ok(Message::Text(text)) => {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
-          if resp.get("id") == Some(&serde_json::json!(cmd_id)) {
-            if let Some(err) = resp.get("error") {
-              return Err(WorkerError::new(
-                WorkerErrorCode::BridgeDisconnected,
-                format!("CDP evaluation error: {err}"),
-              ));
-            }
-            if let Some(exception) = resp.get("result").and_then(|r| r.get("exceptionDetails")) {
-              return Err(WorkerError::new(
-                WorkerErrorCode::BridgeDisconnected,
-                format!("Extension execution exception: {exception}"),
-              ));
-            }
-
-            let value = resp
-              .get("result")
-              .and_then(|r| r.get("result"))
-              .and_then(|r| r.get("value"))
-              .cloned()
-              .or_else(|| resp.get("result").and_then(|r| r.get("value")).cloned())
-              .ok_or_else(|| {
-                WorkerError::new(
+  let wait_fut = async {
+    while let Some(msg) = ws_stream.next().await {
+      match msg {
+        Ok(Message::Text(text)) => {
+          if let Ok(resp) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+            if resp.get("id") == Some(&serde_json::json!(cmd_id)) {
+              if let Some(err) = resp.get("error") {
+                return Err(WorkerError::new(
                   WorkerErrorCode::BridgeDisconnected,
-                  "Missing value in CDP evaluation result",
-                )
-              })?;
+                  format!("CDP evaluation error: {err}"),
+                ));
+              }
+              if let Some(exception) = resp.get("result").and_then(|r| r.get("exceptionDetails")) {
+                return Err(WorkerError::new(
+                  WorkerErrorCode::BridgeDisconnected,
+                  format!("Extension execution exception: {exception}"),
+                ));
+              }
 
-            return Ok(value);
+              let value = resp
+                .get("result")
+                .and_then(|r| r.get("result"))
+                .and_then(|r| r.get("value"))
+                .cloned()
+                .or_else(|| resp.get("result").and_then(|r| r.get("value")).cloned())
+                .ok_or_else(|| {
+                  WorkerError::new(
+                    WorkerErrorCode::BridgeDisconnected,
+                    "Missing value in CDP evaluation result",
+                  )
+                })?;
+
+              return Ok(value);
+            }
           }
         }
+        Ok(Message::Close(_)) => break,
+        Err(e) => {
+          return Err(WorkerError::new(
+            WorkerErrorCode::BridgeDisconnected,
+            format!("WS stream error: {e}"),
+          ));
+        }
+        _ => {}
       }
-      Ok(Message::Close(_)) => break,
-      Err(e) => {
-        return Err(WorkerError::new(
-          WorkerErrorCode::BridgeDisconnected,
-          format!("WS stream error: {e}"),
-        ));
-      }
-      _ => {}
     }
-  }
 
-  Err(WorkerError::new(
-    WorkerErrorCode::BridgeDisconnected,
-    "No evaluate response received from CDP",
-  ))
+    Err(WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      "No evaluate response received from CDP",
+    ))
+  };
+
+  tokio::time::timeout(timeout_dur, wait_fut)
+    .await
+    .map_err(|_| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeTimeout,
+        format!("CDP evaluation timed out after {timeout_dur:?}"),
+      )
+    })?
 }
 
 /// Dispatches a Floword production command to the exact target browser profile extension via CDP isolated context.
@@ -268,7 +279,7 @@ pub async fn dispatch_to_profile_extension(
 
   let url = format!("http://127.0.0.1:{cdp_port}/json");
   let http_client = reqwest::Client::builder()
-    .timeout(std::time::Duration::from_secs(5))
+    .timeout(Duration::from_secs(5))
     .build()
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
 
@@ -334,9 +345,9 @@ pub async fn dispatch_to_profile_extension(
 
   // Drain initial context creation events (up to 500ms timeout)
   let mut isolated_context_ids = Vec::new();
-  let drain_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(300);
+  let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
   while tokio::time::Instant::now() < drain_deadline {
-    match tokio::time::timeout(tokio::time::Duration::from_millis(50), ws_stream.next()).await {
+    match tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
       Ok(Some(Ok(Message::Text(text)))) => {
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
           if event.get("method") == Some(&serde_json::json!("Runtime.executionContextCreated")) {
@@ -368,7 +379,7 @@ pub async fn dispatch_to_profile_extension(
 
   let mut target_context_id: Option<i64> = None;
   for cid in isolated_context_ids.iter().copied() {
-    if let Ok(res) = send_cdp_evaluate(&mut ws_stream, 10 + cid as u64, &bind_expr, Some(cid)).await {
+    if let Ok(res) = send_cdp_evaluate(&mut ws_stream, 10 + cid as u64, &bind_expr, cid, Duration::from_secs(5)).await {
       if res.as_bool() == Some(true) {
         target_context_id = Some(cid);
         break;
@@ -376,10 +387,13 @@ pub async fn dispatch_to_profile_extension(
     }
   }
 
-  // If no isolated context answered, try binding in default context as fallback
-  if target_context_id.is_none() {
-    let _ = send_cdp_evaluate(&mut ws_stream, 99, &bind_expr, None).await;
-  }
+  // Fail-closed: Strictly require isolated context. Never evaluate on default page context!
+  let target_context_id = target_context_id.ok_or_else(|| {
+    WorkerError::new(
+      WorkerErrorCode::ExtensionContextNotFound,
+      format!("Extension isolated execution context not found on grok.com for profile '{profile_id}'"),
+    )
+  })?;
 
   // 5. Execute production command directly in verified isolated context
   let payload_json_str = serde_json::to_string(payload).map_err(|e| {
@@ -405,7 +419,14 @@ pub async fn dispatch_to_profile_extension(
     }})"#
   );
 
-  let prod_result = send_cdp_evaluate(&mut ws_stream, 1001, &exec_expr, target_context_id).await?;
+  let timeout_ms = payload
+    .get("params")
+    .and_then(|p| p.get("timeoutMs"))
+    .and_then(|v| v.as_u64())
+    .unwrap_or(180_000);
+  let method_dur = Duration::from_millis(timeout_ms + 5_000);
+
+  let prod_result = send_cdp_evaluate(&mut ws_stream, 1001, &exec_expr, target_context_id, method_dur).await?;
   Ok(prod_result)
 }
 
@@ -421,7 +442,9 @@ pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandsha
     "leaseId": "SYS",
     "profileId": profile_id,
     "method": "grok.health",
-    "params": {},
+    "params": {
+      "timeoutMs": 10000
+    },
     "createdAt": chrono::Utc::now().to_rfc3339()
   });
 
@@ -594,7 +617,7 @@ pub async fn dispatch_worker_handler(
           "error": {
             "code": err.code_str(),
             "message": err.message,
-            "retryable": true
+            "retryable": err.is_transient()
           }
         })),
       ))
