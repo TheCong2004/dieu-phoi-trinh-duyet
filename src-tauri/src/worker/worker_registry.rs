@@ -221,9 +221,13 @@ impl WorkerRegistry {
       worker.state = WorkerState::LoginRequired;
     } else if req.worker_state == "BUSY" || req.worker_state == "LEASED" {
       worker.state = WorkerState::Busy;
-    } else if worker.current_lease_id.is_none() {
-      // Safe Automatic Reconciliation: Transition to Ready only when IDLE and no active lease
+    } else if req.worker_state == "IDLE" && worker.current_lease_id.is_none() {
+      // Safe Automatic Reconciliation: Transition to Ready ONLY when extension is strictly IDLE and has no active lease
       worker.state = WorkerState::Ready;
+    } else if req.worker_state == "STARTING" || req.worker_state == "RECONCILING" {
+      worker.state = WorkerState::Reconciling;
+    } else {
+      worker.state = WorkerState::Error;
     }
 
     Ok(())
@@ -437,6 +441,38 @@ impl WorkerRegistry {
         format!(
           "Lease profile mismatch: lease profile={}, requested profile={}",
           lease.profile_id, profile_id
+        ),
+      ));
+    }
+
+    // 2. Authoritative Worker Record Cross-Check
+    let worker = state
+      .workers
+      .get(&lease.worker_id)
+      .or_else(|| state.workers.values().find(|w| w.profile_id == profile_id))
+      .ok_or_else(|| {
+        WorkerError::new(
+          WorkerErrorCode::NoAvailableWorker,
+          format!("Worker for lease '{lease_id}' not found in registry"),
+        )
+      })?;
+
+    if worker.profile_id != profile_id {
+      return Err(WorkerError::new(
+        WorkerErrorCode::InvalidProfile,
+        format!(
+          "Worker profile ({}) does not match request profile ({})",
+          worker.profile_id, profile_id
+        ),
+      ));
+    }
+
+    if worker.current_lease_id.as_deref() != Some(lease_id) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::CorrelationMismatch,
+        format!(
+          "Worker active lease mismatch: worker current_lease={:?}, requested lease={}",
+          worker.current_lease_id, lease_id
         ),
       ));
     }

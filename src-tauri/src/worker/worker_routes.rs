@@ -84,6 +84,19 @@ pub async fn release_lease_handler(
   Path(lease_id): Path<String>,
 ) -> impl IntoResponse {
   let res = WORKER_REGISTRY.release(&lease_id).await;
+
+  // Trigger background health probe after release to reconcile to Ready if IDLE
+  let leases = WORKER_REGISTRY.list_leases().await;
+  if let Some(lease) = leases.leases.iter().find(|l| l.lease_id == lease_id) {
+    let profile_id = lease.profile_id.clone();
+    let worker_id = lease.worker_id.clone();
+    tauri::async_runtime::spawn(async move {
+      if let Ok(handshake) = probe_worker_health(&profile_id).await {
+        let _ = WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
+      }
+    });
+  }
+
   (StatusCode::OK, Json(res))
 }
 
@@ -156,10 +169,11 @@ pub async fn dispatch_to_profile_extension(
     .list_profiles()
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to list profiles: {e}")))?;
 
+  // 1. Strict profile ID match (no display name fallback)
   let profile = profiles
     .into_iter()
-    .find(|p| p.id == profile_id || p.name == profile_id)
-    .ok_or_else(|| WorkerError::new(WorkerErrorCode::InvalidProfile, format!("Profile '{profile_id}' not found in runtime")))?;
+    .find(|p| p.id == profile_id)
+    .ok_or_else(|| WorkerError::new(WorkerErrorCode::InvalidProfile, format!("Profile ID '{profile_id}' not found in runtime")))?;
 
   let profile_path = profile.get_profile_data_path(&profiles_dir);
   let profile_path_str = profile_path.to_string_lossy();
@@ -191,23 +205,18 @@ pub async fn dispatch_to_profile_extension(
     .await
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to parse CDP targets: {e}")))?;
 
-  // Pick target: prefer grok / toby page target, fallback to any active page target
+  // 2. Strict grok.com page target selection (never evaluate on arbitrary pages)
   let target = targets
     .iter()
     .find(|t| {
       let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
       let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
-      t_type == "page" && (t_url.contains("grok.com") || t_url.contains("labs.toby.vn"))
-    })
-    .or_else(|| {
-      targets
-        .iter()
-        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+      t_type == "page" && t_url.contains("grok.com")
     })
     .ok_or_else(|| {
       WorkerError::new(
-        WorkerErrorCode::BridgeDisconnected,
-        format!("No usable page target found for profile '{profile_id}'"),
+        WorkerErrorCode::GrokPageNotReady,
+        format!("No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."),
       )
     })?;
 
@@ -229,21 +238,50 @@ pub async fn dispatch_to_profile_extension(
     WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to serialize payload: {e}"))
   })?;
 
+  // 3. Cross-World postMessage bridge with timeout and fallback
   let expression = format!(
     r#"new Promise((resolve, reject) => {{
       const req = {payload_json_str};
+      const replyId = 'FLOWORD_' + Math.random().toString(36).slice(2);
+      let handled = false;
+
+      const handler = (e) => {{
+        if (e.data && e.data.protocol === 'floword-production-reply' && e.data.__flowordReplyId === replyId) {{
+          handled = true;
+          window.removeEventListener('message', handler);
+          clearTimeout(timer);
+          resolve(e.data.result);
+        }}
+      }};
+      window.addEventListener('message', handler);
+
+      const timer = setTimeout(() => {{
+        if (!handled) {{
+          window.removeEventListener('message', handler);
+          reject(new Error('Extension response timeout from isolated world'));
+        }}
+      }}, 180000);
+
+      window.postMessage({{ ...req, __flowordReplyId: replyId }}, '*');
+
       if (typeof window.__tobyflowGrokOnMessage === 'function') {{
-        window.__tobyflowGrokOnMessage(req, null, resolve);
-      }} else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {{
-        chrome.runtime.sendMessage(req, resp => {{
-          if (chrome.runtime.lastError) {{
-            reject(new Error(chrome.runtime.lastError.message));
-          }} else {{
-            resolve(resp);
+        window.__tobyflowGrokOnMessage(req, null, (res) => {{
+          if (!handled) {{
+            handled = true;
+            window.removeEventListener('message', handler);
+            clearTimeout(timer);
+            resolve(res);
           }}
         }});
-      }} else {{
-        reject(new Error('Extension not loaded in active page target'));
+      }} else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {{
+        chrome.runtime.sendMessage(req, (res) => {{
+          if (!handled && !chrome.runtime.lastError) {{
+            handled = true;
+            window.removeEventListener('message', handler);
+            clearTimeout(timer);
+            resolve(res);
+          }}
+        }});
       }}
     }})"#
   );
@@ -280,10 +318,27 @@ pub async fn dispatch_to_profile_extension(
                 format!("Extension execution exception: {exception}"),
               ));
             }
-            if let Some(val) = resp.get("result").and_then(|r| r.get("value")) {
-              return Ok(val.clone());
-            }
-            return Ok(resp.get("result").cloned().unwrap_or(serde_json::json!({})));
+
+            // 4. Extract result.result.value from CDP RemoteObject wrapper
+            let prod_result = resp
+              .get("result")
+              .and_then(|r| r.get("result"))
+              .and_then(|r| r.get("value"))
+              .cloned()
+              .or_else(|| {
+                resp
+                  .get("result")
+                  .and_then(|r| r.get("value"))
+                  .cloned()
+              })
+              .ok_or_else(|| {
+                WorkerError::new(
+                  WorkerErrorCode::BridgeDisconnected,
+                  "Failed to extract ProductionResult value from CDP evaluate response",
+                )
+              })?;
+
+            return Ok(prod_result);
           }
         }
       }
@@ -304,7 +359,7 @@ pub async fn dispatch_to_profile_extension(
   ))
 }
 
-/// Active health probe from Donut Browser to Extension instance.
+/// Active health probe from Donut Browser to Extension instance with zero fake fallbacks.
 pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandshakeRequest, WorkerError> {
   let health_req = serde_json::json!({
     "protocol": "floword-production",
@@ -321,16 +376,84 @@ pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandsha
   });
 
   let res = dispatch_to_profile_extension(profile_id, &health_req).await?;
-  let health_val = res.get("result").unwrap_or(&res);
 
-  let logged_in = health_val.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-  let worker_state = health_val.get("workerState").and_then(|v| v.as_str()).unwrap_or("IDLE").to_string();
-  let ext_ver = health_val.get("extensionVersion").and_then(|v| v.as_str()).unwrap_or("1.1.49").to_string();
-  let caps = health_val
+  let proto = res.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+  let proto_ver = res.get("protocolVersion").and_then(|v| v.as_u64()).unwrap_or(0);
+  if proto != "floword-production" || proto_ver != 1 {
+    return Err(WorkerError::new(
+      WorkerErrorCode::ProtocolMismatch,
+      format!("Health probe protocol mismatch: expected floword-production v1, got '{proto}' v{proto_ver}"),
+    ));
+  }
+
+  let health_val = res.get("result").ok_or_else(|| {
+    WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      "Health response missing 'result' object",
+    )
+  })?;
+
+  let resp_profile = health_val.get("profileId").and_then(|v| v.as_str()).unwrap_or("");
+  if resp_profile != profile_id {
+    return Err(WorkerError::new(
+      WorkerErrorCode::InvalidProfile,
+      format!("Health probe profile mismatch: expected {profile_id}, got {resp_profile}"),
+    ));
+  }
+
+  let logged_in = health_val
+    .get("loggedIn")
+    .and_then(|v| v.as_bool())
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Health response missing required boolean 'loggedIn'",
+      )
+    })?;
+
+  let worker_state = health_val
+    .get("workerState")
+    .and_then(|v| v.as_str())
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Health response missing required string 'workerState'",
+      )
+    })?
+    .to_string();
+
+  let ext_ver = health_val
+    .get("extensionVersion")
+    .and_then(|v| v.as_str())
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Health response missing required string 'extensionVersion'",
+      )
+    })?
+    .to_string();
+
+  let caps_arr = health_val
     .get("capabilities")
     .and_then(|v| v.as_array())
-    .map(|arr| arr.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
-    .unwrap_or_else(|| vec!["grok.image.edit".to_string()]);
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Health response missing required array 'capabilities'",
+      )
+    })?;
+
+  if caps_arr.is_empty() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      "Health response capabilities array cannot be empty",
+    ));
+  }
+
+  let capabilities: Vec<String> = caps_arr
+    .iter()
+    .filter_map(|c| c.as_str().map(|s| s.to_string()))
+    .collect();
 
   Ok(WorkerHealthHandshakeRequest {
     profile_id: profile_id.to_string(),
@@ -338,7 +461,7 @@ pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandsha
     extension_version: ext_ver,
     worker_state,
     logged_in,
-    capabilities: caps,
+    capabilities,
   })
 }
 
@@ -366,7 +489,7 @@ pub async fn dispatch_worker_handler(
     ));
   }
 
-  // 2. Strict Active Lease Validation
+  // 2. Strict Active Lease Validation (Two-way Lease <-> Worker cross check)
   if let Err(err) = WORKER_REGISTRY.validate_active_lease(lease_id, job_id, step_id, attempt_id, profile_id).await {
     let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::CONFLICT);
     return Err((

@@ -1920,13 +1920,30 @@ pub fn run_with_builder(
         }
       }
 
-      // Startup: Load durable worker leases and synchronize profile workers
+      // Startup: Load durable worker leases, synchronize profile workers, and launch health loop
       tauri::async_runtime::spawn(async move {
         crate::worker::WORKER_REGISTRY.load_from_storage().await;
         if let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() {
           crate::worker::WORKER_REGISTRY.sync_startup_profiles(&profiles).await;
         }
         crate::worker::WORKER_REGISTRY.mark_ready().await;
+
+        // Periodic Automatic Health Reconciliation Loop
+        loop {
+          tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+          let workers = crate::worker::WORKER_REGISTRY.list_workers().await;
+          for w in workers.workers {
+            if w.state == crate::worker::WorkerState::Starting
+              || w.state == crate::worker::WorkerState::Reconciling
+            {
+              let profile_id = w.profile_id.clone();
+              let worker_id = w.worker_id.clone();
+              if let Ok(handshake) = crate::worker::worker_routes::probe_worker_health(&profile_id).await {
+                let _ = crate::worker::WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
+              }
+            }
+          }
+        }
       });
 
       // Kill orphaned proxy and VPN worker processes from previous app runs.

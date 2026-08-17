@@ -1459,6 +1459,19 @@ pub async fn launch_browser_profile_impl(
       last_error: None,
     };
     let _ = crate::worker::WORKER_REGISTRY.register_or_update_worker(worker).await;
+
+    // Active health probe loop to reconcile worker from Starting -> Ready
+    let profile_id_clone = updated_profile.id.to_string();
+    let worker_id_clone = format!("browser-profile:{}", updated_profile.id);
+    tauri::async_runtime::spawn(async move {
+      for _ in 0..15 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        if let Ok(handshake) = crate::worker::worker_routes::probe_worker_health(&profile_id_clone).await {
+          let _ = crate::worker::WORKER_REGISTRY.handle_health_handshake(&worker_id_clone, handshake).await;
+          break;
+        }
+      }
+    });
   }
 
   // The proxy PID mapping was already reconciled inside launch_browser_internal

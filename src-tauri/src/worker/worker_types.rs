@@ -37,6 +37,8 @@ pub enum WorkerErrorCode {
   WorkerReconciling,
   WorkerRegistryInitializing,
   BridgeDisconnected,
+  GrokPageNotReady,
+  InvalidHealthResponse,
   Internal,
 }
 
@@ -65,7 +67,10 @@ impl WorkerError {
       | WorkerErrorCode::CorrelationMismatch
       | WorkerErrorCode::ProtocolMismatch
       | WorkerErrorCode::InvalidProfile => 400,
-      WorkerErrorCode::WorkerRegistryInitializing | WorkerErrorCode::BridgeDisconnected => 503,
+      WorkerErrorCode::InvalidHealthResponse => 502,
+      WorkerErrorCode::WorkerRegistryInitializing
+      | WorkerErrorCode::BridgeDisconnected
+      | WorkerErrorCode::GrokPageNotReady => 503,
       WorkerErrorCode::Internal => 500,
     }
   }
@@ -84,6 +89,8 @@ impl WorkerError {
       WorkerErrorCode::WorkerReconciling => "WORKER_RECONCILING",
       WorkerErrorCode::WorkerRegistryInitializing => "WORKER_REGISTRY_INITIALIZING",
       WorkerErrorCode::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+      WorkerErrorCode::GrokPageNotReady => "GROK_PAGE_NOT_READY",
+      WorkerErrorCode::InvalidHealthResponse => "INVALID_HEALTH_RESPONSE",
       WorkerErrorCode::Internal => "INTERNAL_ERROR",
     }
   }
