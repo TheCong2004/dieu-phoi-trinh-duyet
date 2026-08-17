@@ -38,6 +38,7 @@ pub enum WorkerErrorCode {
   WorkerRegistryInitializing,
   BridgeDisconnected,
   GrokPageNotReady,
+  GrokTargetAmbiguous,
   InvalidHealthResponse,
   Internal,
 }
@@ -62,6 +63,7 @@ impl WorkerError {
       WorkerErrorCode::WorkerBusy
       | WorkerErrorCode::NoAvailableWorker
       | WorkerErrorCode::WorkerReconciling
+      | WorkerErrorCode::GrokTargetAmbiguous
       | WorkerErrorCode::LeaseNotActive => 409,
       WorkerErrorCode::InvalidLease
       | WorkerErrorCode::CorrelationMismatch
@@ -90,6 +92,7 @@ impl WorkerError {
       WorkerErrorCode::WorkerRegistryInitializing => "WORKER_REGISTRY_INITIALIZING",
       WorkerErrorCode::BridgeDisconnected => "BRIDGE_DISCONNECTED",
       WorkerErrorCode::GrokPageNotReady => "GROK_PAGE_NOT_READY",
+      WorkerErrorCode::GrokTargetAmbiguous => "GROK_TARGET_AMBIGUOUS",
       WorkerErrorCode::InvalidHealthResponse => "INVALID_HEALTH_RESPONSE",
       WorkerErrorCode::Internal => "INTERNAL_ERROR",
     }

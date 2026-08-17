@@ -1933,13 +1933,25 @@ pub fn run_with_builder(
           tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
           let workers = crate::worker::WORKER_REGISTRY.list_workers().await;
           for w in workers.workers {
+            let profile_id = w.profile_id.clone();
+            let worker_id = w.worker_id.clone();
+
             if w.state == crate::worker::WorkerState::Starting
               || w.state == crate::worker::WorkerState::Reconciling
             {
-              let profile_id = w.profile_id.clone();
-              let worker_id = w.worker_id.clone();
               if let Ok(handshake) = crate::worker::worker_routes::probe_worker_health(&profile_id).await {
                 let _ = crate::worker::WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
+              }
+            } else if w.state == crate::worker::WorkerState::Ready {
+              // Health Freshness Check for idle Ready workers
+              match crate::worker::worker_routes::probe_worker_health(&profile_id).await {
+                Ok(handshake) => {
+                  let _ = crate::worker::WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
+                }
+                Err(_) => {
+                  // Extension disconnected or tab closed -> transition to Reconciling
+                  let _ = crate::worker::WORKER_REGISTRY.reconcile_worker(&worker_id, false, false, None).await;
+                }
               }
             }
           }

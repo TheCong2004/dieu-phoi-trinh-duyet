@@ -159,7 +159,85 @@ pub async fn list_leases_handler() -> Json<ListLeasesResponse> {
   Json(WORKER_REGISTRY.list_leases().await)
 }
 
-/// Dispatches a Floword production command to the exact target browser profile extension via CDP.
+async fn send_cdp_evaluate(
+  ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+  cmd_id: u64,
+  expression: &str,
+  context_id: Option<i64>,
+) -> Result<serde_json::Value, WorkerError> {
+  let mut params = serde_json::json!({
+    "expression": expression,
+    "awaitPromise": true,
+    "returnByValue": true
+  });
+  if let Some(cid) = context_id {
+    params["contextId"] = serde_json::json!(cid);
+  }
+
+  let cdp_req = serde_json::json!({
+    "id": cmd_id,
+    "method": "Runtime.evaluate",
+    "params": params
+  });
+
+  ws_stream
+    .send(Message::Text(cdp_req.to_string().into()))
+    .await
+    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to send CDP evaluate: {e}")))?;
+
+  while let Some(msg) = ws_stream.next().await {
+    match msg {
+      Ok(Message::Text(text)) => {
+        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+          if resp.get("id") == Some(&serde_json::json!(cmd_id)) {
+            if let Some(err) = resp.get("error") {
+              return Err(WorkerError::new(
+                WorkerErrorCode::BridgeDisconnected,
+                format!("CDP evaluation error: {err}"),
+              ));
+            }
+            if let Some(exception) = resp.get("result").and_then(|r| r.get("exceptionDetails")) {
+              return Err(WorkerError::new(
+                WorkerErrorCode::BridgeDisconnected,
+                format!("Extension execution exception: {exception}"),
+              ));
+            }
+
+            let value = resp
+              .get("result")
+              .and_then(|r| r.get("result"))
+              .and_then(|r| r.get("value"))
+              .cloned()
+              .or_else(|| resp.get("result").and_then(|r| r.get("value")).cloned())
+              .ok_or_else(|| {
+                WorkerError::new(
+                  WorkerErrorCode::BridgeDisconnected,
+                  "Missing value in CDP evaluation result",
+                )
+              })?;
+
+            return Ok(value);
+          }
+        }
+      }
+      Ok(Message::Close(_)) => break,
+      Err(e) => {
+        return Err(WorkerError::new(
+          WorkerErrorCode::BridgeDisconnected,
+          format!("WS stream error: {e}"),
+        ));
+      }
+      _ => {}
+    }
+  }
+
+  Err(WorkerError::new(
+    WorkerErrorCode::BridgeDisconnected,
+    "No evaluate response received from CDP",
+  ))
+}
+
+/// Dispatches a Floword production command to the exact target browser profile extension via CDP isolated context.
 pub async fn dispatch_to_profile_extension(
   profile_id: &str,
   payload: &serde_json::Value,
@@ -205,21 +283,34 @@ pub async fn dispatch_to_profile_extension(
     .await
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to parse CDP targets: {e}")))?;
 
-  // 2. Strict grok.com page target selection (never evaluate on arbitrary pages)
-  let target = targets
+  // 2. Strict grok.com page target selection with multi-tab guard
+  let grok_targets: Vec<&serde_json::Value> = targets
     .iter()
-    .find(|t| {
+    .filter(|t| {
       let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
       let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
       t_type == "page" && t_url.contains("grok.com")
     })
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::GrokPageNotReady,
-        format!("No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."),
-      )
-    })?;
+    .collect();
 
+  if grok_targets.is_empty() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::GrokPageNotReady,
+      format!("No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."),
+    ));
+  }
+
+  if grok_targets.len() > 1 {
+    return Err(WorkerError::new(
+      WorkerErrorCode::GrokTargetAmbiguous,
+      format!(
+        "Multiple active grok.com tabs ({}) detected for profile '{profile_id}'. Exactly 1 active Grok tab is required for deterministic execution.",
+        grok_targets.len()
+      ),
+    ));
+  }
+
+  let target = grok_targets[0];
   let ws_url = target
     .get("webSocketDebuggerUrl")
     .and_then(|v| v.as_str())
@@ -234,129 +325,88 @@ pub async fn dispatch_to_profile_extension(
     .await
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to connect to CDP WS: {e}")))?;
 
+  // 3. Discover Execution Contexts via Runtime.enable
+  let enable_req = serde_json::json!({
+    "id": 1,
+    "method": "Runtime.enable"
+  });
+  let _ = ws_stream.send(Message::Text(enable_req.to_string().into())).await;
+
+  // Drain initial context creation events (up to 500ms timeout)
+  let mut isolated_context_ids = Vec::new();
+  let drain_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(300);
+  while tokio::time::Instant::now() < drain_deadline {
+    match tokio::time::timeout(tokio::time::Duration::from_millis(50), ws_stream.next()).await {
+      Ok(Some(Ok(Message::Text(text)))) => {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+          if event.get("method") == Some(&serde_json::json!("Runtime.executionContextCreated")) {
+            if let Some(ctx) = event.get("params").and_then(|p| p.get("context")) {
+              if let Some(cid) = ctx.get("id").and_then(|v| v.as_i64()) {
+                let is_default = ctx.get("auxiliaryData").and_then(|a| a.get("isDefault")).and_then(|v| v.as_bool()).unwrap_or(true);
+                if !is_default {
+                  isolated_context_ids.push(cid);
+                }
+              }
+            }
+          }
+        }
+      }
+      _ => break,
+    }
+  }
+
+  // 4. Privileged Profile Binding: Bind authoritative profileId in Extension isolated context
+  let bind_expr = format!(
+    r#"if (typeof window.__flowordBindRuntimeProfile === 'function') {{
+      window.__flowordBindRuntimeProfile({:?});
+      true;
+    }} else {{
+      false;
+    }}"#,
+    profile_id
+  );
+
+  let mut target_context_id: Option<i64> = None;
+  for cid in isolated_context_ids.iter().copied() {
+    if let Ok(res) = send_cdp_evaluate(&mut ws_stream, 10 + cid as u64, &bind_expr, Some(cid)).await {
+      if res.as_bool() == Some(true) {
+        target_context_id = Some(cid);
+        break;
+      }
+    }
+  }
+
+  // If no isolated context answered, try binding in default context as fallback
+  if target_context_id.is_none() {
+    let _ = send_cdp_evaluate(&mut ws_stream, 99, &bind_expr, None).await;
+  }
+
+  // 5. Execute production command directly in verified isolated context
   let payload_json_str = serde_json::to_string(payload).map_err(|e| {
     WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to serialize payload: {e}"))
   })?;
 
-  // 3. Cross-World postMessage bridge with timeout and fallback
-  let expression = format!(
+  let exec_expr = format!(
     r#"new Promise((resolve, reject) => {{
       const req = {payload_json_str};
-      const replyId = 'FLOWORD_' + Math.random().toString(36).slice(2);
-      let handled = false;
-
-      const handler = (e) => {{
-        if (e.data && e.data.protocol === 'floword-production-reply' && e.data.__flowordReplyId === replyId) {{
-          handled = true;
-          window.removeEventListener('message', handler);
-          clearTimeout(timer);
-          resolve(e.data.result);
-        }}
-      }};
-      window.addEventListener('message', handler);
-
-      const timer = setTimeout(() => {{
-        if (!handled) {{
-          window.removeEventListener('message', handler);
-          reject(new Error('Extension response timeout from isolated world'));
-        }}
-      }}, 180000);
-
-      window.postMessage({{ ...req, __flowordReplyId: replyId }}, '*');
-
       if (typeof window.__tobyflowGrokOnMessage === 'function') {{
-        window.__tobyflowGrokOnMessage(req, null, (res) => {{
-          if (!handled) {{
-            handled = true;
-            window.removeEventListener('message', handler);
-            clearTimeout(timer);
-            resolve(res);
-          }}
-        }});
+        window.__tobyflowGrokOnMessage(req, null, (res) => resolve(res));
       }} else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {{
         chrome.runtime.sendMessage(req, (res) => {{
-          if (!handled && !chrome.runtime.lastError) {{
-            handled = true;
-            window.removeEventListener('message', handler);
-            clearTimeout(timer);
+          if (chrome.runtime.lastError) {{
+            reject(new Error(chrome.runtime.lastError.message));
+          }} else {{
             resolve(res);
           }}
         }});
+      }} else {{
+        reject(new Error('Extension message handler not found in isolated context'));
       }}
     }})"#
   );
 
-  let cdp_req = serde_json::json!({
-    "id": 1001,
-    "method": "Runtime.evaluate",
-    "params": {
-      "expression": expression,
-      "awaitPromise": true,
-      "returnByValue": true
-    }
-  });
-
-  ws_stream
-    .send(Message::Text(cdp_req.to_string().into()))
-    .await
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to send CDP command: {e}")))?;
-
-  while let Some(msg) = ws_stream.next().await {
-    match msg {
-      Ok(Message::Text(text)) => {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
-          if resp.get("id") == Some(&serde_json::json!(1001)) {
-            if let Some(err) = resp.get("error") {
-              return Err(WorkerError::new(
-                WorkerErrorCode::BridgeDisconnected,
-                format!("CDP evaluation error: {err}"),
-              ));
-            }
-            if let Some(exception) = resp.get("result").and_then(|r| r.get("exceptionDetails")) {
-              return Err(WorkerError::new(
-                WorkerErrorCode::BridgeDisconnected,
-                format!("Extension execution exception: {exception}"),
-              ));
-            }
-
-            // 4. Extract result.result.value from CDP RemoteObject wrapper
-            let prod_result = resp
-              .get("result")
-              .and_then(|r| r.get("result"))
-              .and_then(|r| r.get("value"))
-              .cloned()
-              .or_else(|| {
-                resp
-                  .get("result")
-                  .and_then(|r| r.get("value"))
-                  .cloned()
-              })
-              .ok_or_else(|| {
-                WorkerError::new(
-                  WorkerErrorCode::BridgeDisconnected,
-                  "Failed to extract ProductionResult value from CDP evaluate response",
-                )
-              })?;
-
-            return Ok(prod_result);
-          }
-        }
-      }
-      Ok(Message::Close(_)) => break,
-      Err(e) => {
-        return Err(WorkerError::new(
-          WorkerErrorCode::BridgeDisconnected,
-          format!("WS stream error: {e}"),
-        ));
-      }
-      _ => {}
-    }
-  }
-
-  Err(WorkerError::new(
-    WorkerErrorCode::BridgeDisconnected,
-    "No result received from extension via CDP",
-  ))
+  let prod_result = send_cdp_evaluate(&mut ws_stream, 1001, &exec_expr, target_context_id).await?;
+  Ok(prod_result)
 }
 
 /// Active health probe from Donut Browser to Extension instance with zero fake fallbacks.
