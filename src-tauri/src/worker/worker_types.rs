@@ -9,6 +9,7 @@ pub enum WorkerState {
   Ready,
   Leased,
   Busy,
+  Reconciling,
   LoginRequired,
   Error,
 }
@@ -26,6 +27,7 @@ pub enum LeaseStatus {
 pub struct BrowserWorker {
   pub worker_id: String,
   pub profile_id: String,
+  pub pool_id: Option<String>,
   pub state: WorkerState,
   pub capabilities: Vec<String>,
   pub extension_ready: bool,
