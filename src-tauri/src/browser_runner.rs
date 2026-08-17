@@ -1440,6 +1440,27 @@ pub async fn launch_browser_profile_impl(
     updated_profile.id
   );
 
+  // Register worker shell in WORKER_REGISTRY with initial state Starting
+  {
+    let worker_id = format!("browser-profile:{}", updated_profile.id);
+    let worker = crate::worker::BrowserWorker {
+      worker_id,
+      profile_id: updated_profile.id.to_string(),
+      pool_id: updated_profile.group_id.clone(),
+      state: crate::worker::WorkerState::Starting,
+      capabilities: vec![],
+      extension_ready: false,
+      extension_version: None,
+      protocol_version: None,
+      grok_logged_in: None,
+      current_lease_id: None,
+      current_job_id: None,
+      last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
+      last_error: None,
+    };
+    let _ = crate::worker::WORKER_REGISTRY.register_or_update_worker(worker).await;
+  }
+
   // The proxy PID mapping was already reconciled inside launch_browser_internal
   // (placeholder → real browser PID); nothing is ever keyed by a constant here.
 
@@ -1554,6 +1575,10 @@ pub async fn kill_browser_profile(
         profile.name,
         profile.id
       );
+
+      // Mark worker offline in WorkerRegistry
+      let worker_id = format!("browser-profile:{}", profile.id);
+      let _ = crate::worker::WORKER_REGISTRY.mark_worker_offline(&worker_id).await;
 
       // Release team lock if applicable
       crate::team_lock::release_team_lock_if_needed(&profile).await;

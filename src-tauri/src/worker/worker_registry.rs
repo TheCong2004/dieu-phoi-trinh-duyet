@@ -63,7 +63,7 @@ impl WorkerRegistry {
     }
   }
 
-  /// Register or update a browser worker based on real runtime / extension health handshake.
+  /// Register or update a browser worker based on real runtime profile lifecycle.
   pub async fn register_or_update_worker(&self, worker: BrowserWorker) -> Result<(), WorkerError> {
     let mut state = self.state.lock().await;
 
@@ -81,7 +81,67 @@ impl WorkerRegistry {
     Ok(())
   }
 
+  /// Mark a worker offline when its associated browser process is killed/closed.
+  pub async fn mark_worker_offline(&self, worker_id: &str) -> Result<(), WorkerError> {
+    let mut state = self.state.lock().await;
+    if let Some(worker) = state
+      .workers
+      .get_mut(worker_id)
+      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
+    {
+      worker.state = WorkerState::Offline;
+      worker.extension_ready = false;
+    }
+    Ok(())
+  }
+
+  /// Sync known profiles at daemon startup.
+  pub async fn sync_startup_profiles(&self, profiles: &[crate::profile::types::BrowserProfile]) {
+    let mut state = self.state.lock().await;
+    for profile in profiles {
+      let worker_id = format!("browser-profile:{}", profile.id);
+      let is_running = profile.process_id.is_some();
+      let default_state = if is_running {
+        WorkerState::Reconciling
+      } else {
+        WorkerState::Offline
+      };
+
+      // Check if there is an existing active recovered lease for this profile
+      let existing_lease = state
+        .leases
+        .values()
+        .find(|l| l.profile_id == profile.id.to_string() && l.status == LeaseStatus::Active)
+        .cloned();
+
+      let worker = state.workers.entry(worker_id.clone()).or_insert_with(|| {
+        BrowserWorker {
+          worker_id: worker_id.clone(),
+          profile_id: profile.id.to_string(),
+          pool_id: profile.group_id.clone(),
+          state: default_state,
+          capabilities: vec![],
+          extension_ready: false,
+          extension_version: None,
+          protocol_version: None,
+          grok_logged_in: None,
+          current_lease_id: None,
+          current_job_id: None,
+          last_heartbeat_at: None,
+          last_error: None,
+        }
+      });
+
+      if let Some(ref lease) = existing_lease {
+        worker.current_lease_id = Some(lease.lease_id.clone());
+        worker.current_job_id = Some(lease.job_id.clone());
+        worker.state = WorkerState::Leased;
+      }
+    }
+  }
+
   /// Real worker handshake from browser runtime / extension health probe.
+  /// Seamlessly performs health update and automatic reconciliation.
   pub async fn handle_health_handshake(
     &self,
     worker_id: &str,
@@ -96,9 +156,21 @@ impl WorkerRegistry {
       ));
     }
 
-    let worker = state.workers.get_mut(worker_id).ok_or_else(|| {
-      WorkerError::new(WorkerErrorCode::NoAvailableWorker, format!("Worker {worker_id} not registered in runtime"))
-    })?;
+    let worker = state
+      .workers
+      .get_mut(worker_id)
+      .or_else(|| {
+        state
+          .workers
+          .values_mut()
+          .find(|w| w.profile_id == worker_id || w.profile_id == req.profile_id)
+      })
+      .ok_or_else(|| {
+        WorkerError::new(
+          WorkerErrorCode::NoAvailableWorker,
+          format!("Worker {worker_id} not registered in runtime"),
+        )
+      })?;
 
     if worker.profile_id != req.profile_id {
       worker.state = WorkerState::Error;
@@ -123,6 +195,7 @@ impl WorkerRegistry {
     } else if req.worker_state == "BUSY" || req.worker_state == "LEASED" {
       worker.state = WorkerState::Busy;
     } else if worker.current_lease_id.is_none() {
+      // Safe Automatic Reconciliation: Transition to Ready only when IDLE and no active lease
       worker.state = WorkerState::Ready;
     }
 
@@ -327,7 +400,13 @@ impl WorkerRegistry {
     let worker = state
       .workers
       .get_mut(worker_id)
-      .ok_or_else(|| WorkerError::new(WorkerErrorCode::NoAvailableWorker, format!("Worker {worker_id} not found")))?;
+      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
+      .ok_or_else(|| {
+        WorkerError::new(
+          WorkerErrorCode::NoAvailableWorker,
+          format!("Worker {worker_id} not found"),
+        )
+      })?;
 
     if !is_healthy {
       worker.state = WorkerState::Error;
@@ -456,11 +535,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_02_health_handshake_registration() {
+  async fn test_02_real_runtime_registration_then_health_handshake() {
     let registry = WorkerRegistry::new();
     let worker = BrowserWorker {
-      worker_id: "WORKER_01".to_string(),
-      profile_id: "PROFILE_GROK_01".to_string(),
+      worker_id: "browser-profile:PROFILE_A".to_string(),
+      profile_id: "PROFILE_A".to_string(),
       pool_id: None,
       state: WorkerState::Starting,
       capabilities: vec![],
@@ -476,8 +555,8 @@ mod tests {
     registry.register_or_update_worker(worker).await.unwrap();
 
     // Valid handshake
-    registry.handle_health_handshake("WORKER_01", WorkerHealthHandshakeRequest {
-      profile_id: "PROFILE_GROK_01".to_string(),
+    registry.handle_health_handshake("browser-profile:PROFILE_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
       protocol_version: 1,
       extension_version: "1.1.49".to_string(),
       worker_state: "IDLE".to_string(),
@@ -486,13 +565,68 @@ mod tests {
     }).await.unwrap();
 
     let state = registry.state.lock().await;
-    let w = state.workers.get("WORKER_01").unwrap();
+    let w = state.workers.get("browser-profile:PROFILE_A").unwrap();
     assert_eq!(w.state, WorkerState::Ready);
     assert_eq!(w.grok_logged_in, Some(true));
   }
 
   #[tokio::test]
-  async fn test_03_safe_release_moves_worker_to_reconciling() {
+  async fn test_03_health_for_unknown_worker_rejected() {
+    let registry = WorkerRegistry::new();
+    let err = registry.handle_health_handshake("UNKNOWN_WORKER", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_X".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::NoAvailableWorker);
+  }
+
+  #[tokio::test]
+  async fn test_04_profile_mismatch_fails() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None);
+
+    let err = registry.handle_health_handshake("browser-profile:PROFILE_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_B".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::InvalidProfile);
+    let state = registry.state.lock().await;
+    let w = state.workers.get("browser-profile:PROFILE_A").unwrap();
+    assert_eq!(w.state, WorkerState::Error);
+  }
+
+  #[tokio::test]
+  async fn test_05_protocol_mismatch_fails() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None);
+
+    let err = registry.handle_health_handshake("browser-profile:PROFILE_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 2, // incompatible
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::ProtocolMismatch);
+  }
+
+  #[tokio::test]
+  async fn test_06_release_moves_worker_to_reconciling() {
     let registry = WorkerRegistry::new();
     seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
 
@@ -514,7 +648,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_04_reconcile_idle_transitions_to_ready() {
+  async fn test_07_health_idle_after_release_transitions_to_ready() {
     let registry = WorkerRegistry::new();
     seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
 
@@ -529,13 +663,23 @@ mod tests {
 
     registry.release(&res.lease_id).await;
 
-    // Reconcile confirming idle
-    let st = registry.reconcile_worker("WORKER_01", true, true, Some(true)).await.unwrap();
-    assert_eq!(st, WorkerState::Ready);
+    // Health probe returns IDLE
+    registry.handle_health_handshake("WORKER_01", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_GROK_01".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_01").unwrap();
+    assert_eq!(w.state, WorkerState::Ready);
   }
 
   #[tokio::test]
-  async fn test_05_reconcile_busy_remains_non_schedulable() {
+  async fn test_08_health_busy_after_release_remains_non_schedulable() {
     let registry = WorkerRegistry::new();
     seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
 
@@ -550,9 +694,19 @@ mod tests {
 
     registry.release(&res.lease_id).await;
 
-    // Reconcile reporting Extension is still busy
-    let st = registry.reconcile_worker("WORKER_01", false, true, Some(true)).await.unwrap();
-    assert_eq!(st, WorkerState::Busy);
+    // Health probe returns BUSY
+    registry.handle_health_handshake("WORKER_01", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_GROK_01".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "BUSY".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_01").unwrap();
+    assert_eq!(w.state, WorkerState::Busy);
 
     // Cannot acquire busy worker
     let err = registry.acquire(AcquireWorkerRequest {
@@ -568,36 +722,46 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_06_typed_pool_not_found_error() {
+  async fn test_09_logout_after_release_sets_login_required() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", Some("REAL_POOL"));
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
 
-    let err = registry.acquire(AcquireWorkerRequest {
+    let res = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_001".to_string(),
       step_id: "GENERATING_IMAGE".to_string(),
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
-      pool_id: Some("UNKNOWN_POOL".to_string()),
+      pool_id: None,
       ttl_seconds: Some(120),
-    }).await;
+    }).await.unwrap();
 
-    assert!(err.is_err());
-    let e = err.unwrap_err();
-    assert_eq!(e.code, WorkerErrorCode::PoolNotFound);
-    assert_eq!(e.status_code(), 404);
-    assert_eq!(e.code_str(), "POOL_NOT_FOUND");
+    registry.release(&res.lease_id).await;
+
+    // Health probe returns logged_in = false
+    registry.handle_health_handshake("WORKER_01", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_GROK_01".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: false,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_01").unwrap();
+    assert_eq!(w.state, WorkerState::LoginRequired);
   }
 
   #[tokio::test]
-  async fn test_07_restart_recovery_prevents_double_lease() {
+  async fn test_10_startup_active_lease_recovery_prevents_double_lease() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
 
     let active_lease = WorkerLease {
-      lease_id: "LEASE_PERSISTED_001".to_string(),
-      worker_id: "WORKER_01".to_string(),
-      profile_id: "PROFILE_GROK_01".to_string(),
-      job_id: "JOB_PREV".to_string(),
+      lease_id: "LEASE_PERSISTED_A".to_string(),
+      worker_id: "WORKER_A".to_string(),
+      profile_id: "PROFILE_A".to_string(),
+      job_id: "JOB_A".to_string(),
       step_id: "GENERATING_IMAGE".to_string(),
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
@@ -612,7 +776,7 @@ mod tests {
 
     // Try to acquire same worker for another job -> MUST FAIL
     let err = registry.acquire(AcquireWorkerRequest {
-      job_id: "JOB_NEW".to_string(),
+      job_id: "JOB_B".to_string(),
       step_id: "GENERATING_IMAGE".to_string(),
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
@@ -625,7 +789,100 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_08_100_acquire_release_reconcile_cycles_no_deadlock() {
+  async fn test_11_startup_recovered_busy_extension_retains_ownership() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+
+    let active_lease = WorkerLease {
+      lease_id: "LEASE_A".to_string(),
+      worker_id: "WORKER_A".to_string(),
+      profile_id: "PROFILE_A".to_string(),
+      job_id: "JOB_A".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      status: LeaseStatus::Active,
+      acquired_at: Utc::now().to_rfc3339(),
+      expires_at: (Utc::now() + Duration::seconds(120)).to_rfc3339(),
+      last_heartbeat_at: Utc::now().to_rfc3339(),
+    };
+
+    registry.recover_leases(vec![active_lease]).await;
+
+    // Probe says still busy
+    registry.handle_health_handshake("WORKER_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "BUSY".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_A").unwrap();
+    assert_eq!(w.state, WorkerState::Busy);
+  }
+
+  #[tokio::test]
+  async fn test_12_startup_recovered_idle_extension_terminalizes_stale_lease_safely() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+
+    let active_lease = WorkerLease {
+      lease_id: "LEASE_A".to_string(),
+      worker_id: "WORKER_A".to_string(),
+      profile_id: "PROFILE_A".to_string(),
+      job_id: "JOB_A".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      status: LeaseStatus::Active,
+      acquired_at: Utc::now().to_rfc3339(),
+      expires_at: (Utc::now() + Duration::seconds(120)).to_rfc3339(),
+      last_heartbeat_at: Utc::now().to_rfc3339(),
+    };
+
+    registry.recover_leases(vec![active_lease]).await;
+
+    // Release/terminalize stale lease on daemon restart
+    registry.release("LEASE_A").await;
+
+    // Health probe confirms IDLE
+    registry.handle_health_handshake("WORKER_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_A").unwrap();
+    assert_eq!(w.state, WorkerState::Ready);
+  }
+
+  #[tokio::test]
+  async fn test_13_recovered_lease_wrong_profile_fails() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+
+    let err = registry.handle_health_handshake("WORKER_A", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_WRONG".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::InvalidProfile);
+  }
+
+  #[tokio::test]
+  async fn test_14_100_acquire_release_reconcile_sequential_cycles_no_deadlock() {
     let registry = Arc::new(WorkerRegistry::new());
     seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
 
@@ -642,5 +899,78 @@ mod tests {
       registry.release(&res.lease_id).await;
       registry.reconcile_worker("WORKER_01", true, true, Some(true)).await.unwrap();
     }
+
+    let state = registry.state.lock().await;
+    let w = state.workers.get("WORKER_01").unwrap();
+    assert_eq!(w.state, WorkerState::Ready);
+  }
+
+  #[tokio::test]
+  async fn test_15_double_acquire_without_release_returns_worker_busy() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+
+    let _res1 = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_A".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await.unwrap();
+
+    let err = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_B".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::WorkerBusy);
+  }
+
+  #[tokio::test]
+  async fn test_16_sequential_reuse_different_jobs() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+
+    // Job 1 acquires
+    let res1 = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_001".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await.unwrap();
+    assert_eq!(res1.profile_id, "PROFILE_A");
+
+    // Job 1 releases
+    registry.release(&res1.lease_id).await;
+
+    // Health reports IDLE
+    registry.handle_health_handshake("WORKER_01", WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: true,
+      capabilities: vec!["grok.image.edit".to_string()],
+    }).await.unwrap();
+
+    // Job 2 acquires same profile with new lease
+    let res2 = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_002".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await.unwrap();
+    assert_eq!(res2.profile_id, "PROFILE_A");
+    assert_ne!(res1.lease_id, res2.lease_id);
   }
 }

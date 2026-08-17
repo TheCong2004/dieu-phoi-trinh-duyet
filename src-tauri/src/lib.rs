@@ -1920,6 +1920,14 @@ pub fn run_with_builder(
         }
       }
 
+      // Startup: Load durable worker leases and synchronize profile workers
+      tauri::async_runtime::spawn(async move {
+        crate::worker::WORKER_REGISTRY.load_from_storage().await;
+        if let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() {
+          crate::worker::WORKER_REGISTRY.sync_startup_profiles(&profiles).await;
+        }
+      });
+
       // Kill orphaned proxy and VPN worker processes from previous app runs.
       // Since active_proxies is an in-memory map that starts empty, any running
       // donut-proxy workers on disk must be orphans the current app can't track.
