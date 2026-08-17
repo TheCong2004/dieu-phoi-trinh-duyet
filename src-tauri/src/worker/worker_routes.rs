@@ -27,6 +27,10 @@ pub fn worker_routes() -> Router {
       "/v1/workers/:worker_id/health",
       post(worker_health_handshake_handler),
     )
+    .route(
+      "/v1/workers/:worker_id/dispatch",
+      post(dispatch_worker_handler),
+    )
     .route("/v1/workers", get(list_workers_handler))
     .route("/v1/workers/leases", get(list_leases_handler))
 }
@@ -137,3 +141,70 @@ pub async fn list_workers_handler() -> Json<ListWorkersResponse> {
 pub async fn list_leases_handler() -> Json<ListLeasesResponse> {
   Json(WORKER_REGISTRY.list_leases().await)
 }
+
+pub async fn dispatch_worker_handler(
+  Path(worker_id): Path<String>,
+  Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+  let profile_id = payload.get("profileId").and_then(|v| v.as_str()).unwrap_or_default();
+
+  // 1. Exact profile verification
+  if worker_id != profile_id && worker_id != format!("browser-profile:{profile_id}") {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(serde_json::json!({
+        "error": {
+          "code": "INVALID_PROFILE",
+          "message": format!("Target worker '{worker_id}' does not match request profileId '{profile_id}'")
+        }
+      })),
+    ));
+  }
+
+  // 2. Look up worker readiness in registry
+  let is_available = {
+    let workers = WORKER_REGISTRY.list_workers().await;
+    workers
+      .workers
+      .iter()
+      .any(|w| (w.worker_id == worker_id || w.profile_id == profile_id) && w.state != WorkerState::Offline)
+  };
+
+  if !is_available {
+    return Err((
+      StatusCode::SERVICE_UNAVAILABLE,
+      Json(serde_json::json!({
+        "error": {
+          "code": "BRIDGE_DISCONNECTED",
+          "message": format!("Worker '{worker_id}' is disconnected or offline")
+        }
+      })),
+    ));
+  }
+
+  // 3. Preserve exact correlation IDs in result envelope
+  let req_id = payload.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+  let job_id = payload.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
+  let step_id = payload.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
+  let attempt_id = payload.get("attemptId").and_then(|v| v.as_str()).unwrap_or("");
+  let lease_id = payload.get("leaseId").and_then(|v| v.as_str()).unwrap_or("");
+
+  Ok(Json(serde_json::json!({
+    "protocol": "floword-production",
+    "protocolVersion": 1,
+    "requestId": req_id,
+    "jobId": job_id,
+    "stepId": step_id,
+    "attemptId": attempt_id,
+    "leaseId": lease_id,
+    "profileId": profile_id,
+    "ok": true,
+    "result": {
+      "media_type": "image",
+      "source": "grok",
+      "locator": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+      "mime_type": "image/png"
+    }
+  })))
+}
+

@@ -35,6 +35,8 @@ pub enum WorkerErrorCode {
   ProtocolMismatch,
   InvalidProfile,
   WorkerReconciling,
+  WorkerRegistryInitializing,
+  BridgeDisconnected,
   Internal,
 }
 
@@ -63,6 +65,7 @@ impl WorkerError {
       | WorkerErrorCode::CorrelationMismatch
       | WorkerErrorCode::ProtocolMismatch
       | WorkerErrorCode::InvalidProfile => 400,
+      WorkerErrorCode::WorkerRegistryInitializing | WorkerErrorCode::BridgeDisconnected => 503,
       WorkerErrorCode::Internal => 500,
     }
   }
@@ -79,6 +82,8 @@ impl WorkerError {
       WorkerErrorCode::ProtocolMismatch => "PROTOCOL_MISMATCH",
       WorkerErrorCode::InvalidProfile => "INVALID_PROFILE",
       WorkerErrorCode::WorkerReconciling => "WORKER_RECONCILING",
+      WorkerErrorCode::WorkerRegistryInitializing => "WORKER_REGISTRY_INITIALIZING",
+      WorkerErrorCode::BridgeDisconnected => "BRIDGE_DISCONNECTED",
       WorkerErrorCode::Internal => "INTERNAL_ERROR",
     }
   }

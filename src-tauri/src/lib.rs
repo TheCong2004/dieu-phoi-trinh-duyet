@@ -1926,6 +1926,7 @@ pub fn run_with_builder(
         if let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() {
           crate::worker::WORKER_REGISTRY.sync_startup_profiles(&profiles).await;
         }
+        crate::worker::WORKER_REGISTRY.mark_ready().await;
       });
 
       // Kill orphaned proxy and VPN worker processes from previous app runs.

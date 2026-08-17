@@ -17,6 +17,7 @@ lazy_static! {
 struct RegistryState {
   workers: HashMap<String, BrowserWorker>,
   leases: HashMap<String, WorkerLease>,
+  is_ready: bool,
 }
 
 #[derive(Clone)]
@@ -32,12 +33,16 @@ impl Default for WorkerRegistry {
 }
 
 impl WorkerRegistry {
-  /// Production constructor: Starts with EMPTY in-memory maps.
+  /// Production constructor: Starts with EMPTY in-memory maps and is_ready = false.
   /// Workers are populated strictly from real runtime probes / profile manager.
   pub fn new() -> Self {
     let storage_path = Some(crate::app_dirs::data_dir().join("worker_leases.json"));
     Self {
-      state: Arc::new(Mutex::new(RegistryState::default())),
+      state: Arc::new(Mutex::new(RegistryState {
+        workers: HashMap::new(),
+        leases: HashMap::new(),
+        is_ready: false,
+      })),
       storage_path,
     }
   }
@@ -45,9 +50,31 @@ impl WorkerRegistry {
   /// Constructor for tests with custom in-memory or temporary storage path.
   pub fn with_custom_storage(storage_path: Option<PathBuf>) -> Self {
     Self {
-      state: Arc::new(Mutex::new(RegistryState::default())),
+      state: Arc::new(Mutex::new(RegistryState {
+        workers: HashMap::new(),
+        leases: HashMap::new(),
+        is_ready: true,
+      })),
       storage_path,
     }
+  }
+
+  /// Mark registry ready once startup recovery and profile sync finish.
+  pub async fn mark_ready(&self) {
+    let mut state = self.state.lock().await;
+    state.is_ready = true;
+  }
+
+  /// Set readiness explicitly (used in tests).
+  pub async fn set_ready(&self, ready: bool) {
+    let mut state = self.state.lock().await;
+    state.is_ready = ready;
+  }
+
+  /// Check whether registry is ready to serve acquire requests.
+  pub async fn is_ready(&self) -> bool {
+    let state = self.state.lock().await;
+    state.is_ready
   }
 
   /// Internal helper to persist all durable leases to disk.
@@ -205,6 +232,15 @@ impl WorkerRegistry {
   /// Atomically acquires an exclusive worker lease for a specific step attempt.
   pub async fn acquire(&self, req: AcquireWorkerRequest) -> Result<AcquireWorkerResponse, WorkerError> {
     let mut state = self.state.lock().await;
+
+    // Startup Readiness Barrier: Reject with 503 if still initializing
+    if !state.is_ready {
+      return Err(WorkerError::new(
+        WorkerErrorCode::WorkerRegistryInitializing,
+        "Worker registry is still initializing startup recovery",
+      ));
+    }
+
     let now = Utc::now();
 
     // 1. First reap expired leases safely (marks worker RECONCILING, never blindly READY)
@@ -524,6 +560,7 @@ mod tests {
       last_error: None,
     };
     let mut state = registry.state.blocking_lock();
+    state.is_ready = true;
     state.workers.insert(worker_id.to_string(), worker);
   }
 
@@ -532,11 +569,13 @@ mod tests {
     let registry = WorkerRegistry::new();
     let state = registry.state.blocking_lock();
     assert_eq!(state.workers.len(), 0, "Production WorkerRegistry::new() must start empty");
+    assert!(!state.is_ready, "Production WorkerRegistry starts in INITIALIZING state");
   }
 
   #[tokio::test]
   async fn test_02_real_runtime_registration_then_health_handshake() {
     let registry = WorkerRegistry::new();
+    registry.mark_ready().await;
     let worker = BrowserWorker {
       worker_id: "browser-profile:PROFILE_A".to_string(),
       profile_id: "PROFILE_A".to_string(),
@@ -573,6 +612,7 @@ mod tests {
   #[tokio::test]
   async fn test_03_health_for_unknown_worker_rejected() {
     let registry = WorkerRegistry::new();
+    registry.mark_ready().await;
     let err = registry.handle_health_handshake("UNKNOWN_WORKER", WorkerHealthHandshakeRequest {
       profile_id: "PROFILE_X".to_string(),
       protocol_version: 1,
@@ -973,4 +1013,97 @@ mod tests {
     assert_eq!(res2.profile_id, "PROFILE_A");
     assert_ne!(res1.lease_id, res2.lease_id);
   }
+
+  // TEST GROUP D — Startup readiness barrier
+  #[tokio::test]
+  async fn test_d1_acquire_during_initializing_returns_503_registry_initializing() {
+    let registry = WorkerRegistry::new();
+    // Initially not marked ready
+    assert!(!registry.is_ready().await);
+
+    let err = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_INIT_01".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await;
+
+    assert!(err.is_err());
+    let e = err.unwrap_err();
+    assert_eq!(e.code, WorkerErrorCode::WorkerRegistryInitializing);
+    assert_eq!(e.status_code(), 503);
+  }
+
+  #[tokio::test]
+  async fn test_d2_load_persisted_active_lease_denies_acquire_same_profile() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_ACTIVE", "PROFILE_PERSISTED", None);
+
+    let active_lease = WorkerLease {
+      lease_id: "LEASE_PERSISTED_001".to_string(),
+      worker_id: "WORKER_ACTIVE".to_string(),
+      profile_id: "PROFILE_PERSISTED".to_string(),
+      job_id: "JOB_PERSISTED".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      status: LeaseStatus::Active,
+      acquired_at: Utc::now().to_rfc3339(),
+      expires_at: (Utc::now() + Duration::seconds(120)).to_rfc3339(),
+      last_heartbeat_at: Utc::now().to_rfc3339(),
+    };
+
+    registry.recover_leases(vec![active_lease]).await;
+    registry.mark_ready().await;
+
+    let err = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_NEW_02".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await;
+
+    assert!(err.is_err());
+    assert_eq!(err.unwrap_err().code, WorkerErrorCode::WorkerBusy);
+  }
+
+  #[tokio::test]
+  async fn test_d3_registry_ready_allows_eligible_acquire() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_READY", None);
+    registry.mark_ready().await;
+
+    let res = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_READY_01".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap().profile_id, "PROFILE_READY");
+  }
+
+  #[tokio::test]
+  async fn test_d4_corrupt_storage_fails_safely_without_silent_wipe() {
+    let temp_dir = std::env::temp_dir().join(format!("donut_test_{}", Uuid::new_v4()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let corrupt_file = temp_dir.join("corrupt_leases.json");
+    let _ = fs::write(&corrupt_file, b"NOT_VALID_JSON{[[");
+
+    let registry = WorkerRegistry::with_custom_storage(Some(corrupt_file.clone()));
+    registry.load_from_storage().await;
+
+    // File should remain on disk and not silently wiped
+    assert!(corrupt_file.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+  }
+}
+
 }
