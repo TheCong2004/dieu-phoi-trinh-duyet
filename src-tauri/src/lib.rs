@@ -1923,7 +1923,8 @@ pub fn run_with_builder(
       // Startup: Load durable worker leases, synchronize profile workers, and launch health loop
       tauri::async_runtime::spawn(async move {
         crate::worker::WORKER_REGISTRY.load_from_storage().await;
-        if let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() {
+        let startup_profiles = crate::profile::ProfileManager::instance().list_profiles().ok();
+        if let Some(profiles) = startup_profiles {
           crate::worker::WORKER_REGISTRY.sync_startup_profiles(&profiles).await;
         }
         crate::worker::WORKER_REGISTRY.mark_ready().await;

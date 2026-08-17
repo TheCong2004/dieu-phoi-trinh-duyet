@@ -41,6 +41,7 @@ pub enum WorkerErrorCode {
   ExtensionContextNotFound,
   GrokPageNotReady,
   GrokTargetAmbiguous,
+  GrokNotLoggedIn,
   InvalidHealthResponse,
   Internal,
 }
@@ -78,6 +79,7 @@ impl WorkerError {
       | WorkerErrorCode::NoAvailableWorker
       | WorkerErrorCode::WorkerReconciling
       | WorkerErrorCode::GrokTargetAmbiguous
+      | WorkerErrorCode::GrokNotLoggedIn
       | WorkerErrorCode::LeaseNotActive => 409,
       WorkerErrorCode::InvalidLease
       | WorkerErrorCode::CorrelationMismatch
@@ -111,6 +113,7 @@ impl WorkerError {
       WorkerErrorCode::ExtensionContextNotFound => "EXTENSION_CONTEXT_NOT_FOUND",
       WorkerErrorCode::GrokPageNotReady => "GROK_PAGE_NOT_READY",
       WorkerErrorCode::GrokTargetAmbiguous => "GROK_TARGET_AMBIGUOUS",
+      WorkerErrorCode::GrokNotLoggedIn => "GROK_NOT_LOGGED_IN",
       WorkerErrorCode::InvalidHealthResponse => "INVALID_HEALTH_RESPONSE",
       WorkerErrorCode::Internal => "INTERNAL_ERROR",
     }
@@ -164,6 +167,7 @@ pub struct AcquireWorkerRequest {
   pub attempt_id: String,
   pub capability: String,
   pub pool_id: Option<String>,
+  pub profile_id: Option<String>,
   pub ttl_seconds: Option<u64>,
 }
 

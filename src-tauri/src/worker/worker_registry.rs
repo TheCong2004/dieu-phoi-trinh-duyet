@@ -111,13 +111,16 @@ impl WorkerRegistry {
   /// Mark a worker offline when its associated browser process is killed/closed.
   pub async fn mark_worker_offline(&self, worker_id: &str) -> Result<(), WorkerError> {
     let mut state = self.state.lock().await;
-    if let Some(worker) = state
-      .workers
-      .get_mut(worker_id)
-      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
-    {
-      worker.state = WorkerState::Offline;
-      worker.extension_ready = false;
+    let target_key = if state.workers.contains_key(worker_id) {
+      Some(worker_id.to_string())
+    } else {
+      state.workers.values().find(|w| w.profile_id == worker_id).map(|w| w.worker_id.clone())
+    };
+    if let Some(key) = target_key {
+      if let Some(worker) = state.workers.get_mut(&key) {
+        worker.state = WorkerState::Offline;
+        worker.extension_ready = false;
+      }
     }
     Ok(())
   }
@@ -125,13 +128,16 @@ impl WorkerRegistry {
   /// Mark a worker as fatal error upon non-transient mismatch.
   pub async fn mark_worker_error(&self, worker_id: &str, error_msg: String) -> Result<(), WorkerError> {
     let mut state = self.state.lock().await;
-    if let Some(worker) = state
-      .workers
-      .get_mut(worker_id)
-      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
-    {
-      worker.state = WorkerState::Error;
-      worker.last_error = Some(error_msg);
+    let target_key = if state.workers.contains_key(worker_id) {
+      Some(worker_id.to_string())
+    } else {
+      state.workers.values().find(|w| w.profile_id == worker_id).map(|w| w.worker_id.clone())
+    };
+    if let Some(key) = target_key {
+      if let Some(worker) = state.workers.get_mut(&key) {
+        worker.state = WorkerState::Error;
+        worker.last_error = Some(error_msg);
+      }
     }
     Ok(())
   }
@@ -197,21 +203,24 @@ impl WorkerRegistry {
       ));
     }
 
-    let worker = state
-      .workers
-      .get_mut(worker_id)
-      .or_else(|| {
-        state
-          .workers
-          .values_mut()
-          .find(|w| w.profile_id == worker_id || w.profile_id == req.profile_id)
-      })
-      .ok_or_else(|| {
-        WorkerError::new(
-          WorkerErrorCode::NoAvailableWorker,
-          format!("Worker {worker_id} not registered in runtime"),
-        )
-      })?;
+    let target_key = if state.workers.contains_key(worker_id) {
+      Some(worker_id.to_string())
+    } else {
+      state
+        .workers
+        .values()
+        .find(|w| w.profile_id == worker_id || w.profile_id == req.profile_id)
+        .map(|w| w.worker_id.clone())
+    };
+
+    let target_key = target_key.ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::NoAvailableWorker,
+        format!("Worker {worker_id} not registered in runtime"),
+      )
+    })?;
+
+    let worker = state.workers.get_mut(&target_key).unwrap();
 
     if worker.profile_id != req.profile_id {
       worker.state = WorkerState::Error;
@@ -265,16 +274,20 @@ impl WorkerRegistry {
   ) -> Result<WorkerState, WorkerError> {
     let mut state = self.state.lock().await;
 
-    let worker = state
-      .workers
-      .get_mut(worker_id)
-      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
-      .ok_or_else(|| {
-        WorkerError::new(
-          WorkerErrorCode::NoAvailableWorker,
-          format!("Worker '{worker_id}' not found in registry"),
-        )
-      })?;
+    let target_key = if state.workers.contains_key(worker_id) {
+      Some(worker_id.to_string())
+    } else {
+      state.workers.values().find(|w| w.profile_id == worker_id).map(|w| w.worker_id.clone())
+    };
+
+    let target_key = target_key.ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::NoAvailableWorker,
+        format!("Worker '{worker_id}' not found in registry"),
+      )
+    })?;
+
+    let worker = state.workers.get_mut(&target_key).unwrap();
 
     if let Some(logged_in) = grok_logged_in {
       worker.grok_logged_in = Some(logged_in);
@@ -315,22 +328,23 @@ impl WorkerRegistry {
     let now = Utc::now();
 
     // 1. First reap expired leases safely (marks worker RECONCILING, never blindly READY)
-    let mut modified = false;
+    let mut expired_workers = Vec::new();
     for lease in state.leases.values_mut() {
       if lease.status == LeaseStatus::Active {
         if let Ok(exp) = DateTime::parse_from_rfc3339(&lease.expires_at) {
           if now > exp.with_timezone(&Utc) {
             lease.status = LeaseStatus::Expired;
-            modified = true;
-            if let Some(w) = state.workers.get_mut(&lease.worker_id) {
-              if w.current_lease_id.as_deref() == Some(&lease.lease_id) {
-                w.current_lease_id = None;
-                w.current_job_id = None;
-                // Move to RECONCILING, not immediately READY to prevent cross-job collision
-                w.state = WorkerState::Reconciling;
-              }
-            }
+            expired_workers.push((lease.lease_id.clone(), lease.worker_id.clone()));
           }
+        }
+      }
+    }
+    for (lease_id, worker_id) in expired_workers {
+      if let Some(w) = state.workers.get_mut(&worker_id) {
+        if w.current_lease_id.as_deref() == Some(&lease_id) {
+          w.current_lease_id = None;
+          w.current_job_id = None;
+          w.state = WorkerState::Reconciling;
         }
       }
     }
@@ -351,60 +365,85 @@ impl WorkerRegistry {
       .workers
       .values()
       .find(|w| {
-        let pool_ok = match req.pool_id {
-          Some(ref p) => w.pool_id.as_deref() == Some(p.as_str()),
-          None => true,
-        };
-
-        pool_ok
-          && w.state == WorkerState::Ready
-          && w.current_lease_id.is_none()
-          && w.extension_ready
-          && w.grok_logged_in.unwrap_or(false)
-          && w.capabilities.iter().any(|c| c == &req.capability)
+        // State must be READY
+        if w.state != WorkerState::Ready {
+          return false;
+        }
+        // Pool filter
+        if let Some(ref pool) = req.pool_id {
+          if w.pool_id.as_deref() != Some(pool.as_str()) {
+            return false;
+          }
+        }
+        // Capability filter
+        if !w.capabilities.contains(&req.capability) {
+          return false;
+        }
+        // Extension must be confirmed ready
+        if !w.extension_ready {
+          return false;
+        }
+        // Must be logged into Grok
+        if w.grok_logged_in != Some(true) {
+          return false;
+        }
+        // Must not hold an existing lease
+        if w.current_lease_id.is_some() {
+          return false;
+        }
+        true
       })
       .map(|w| w.worker_id.clone());
 
-    let worker_id = match eligible_worker_id {
-      Some(id) => id,
-      None => {
-        // Check why no worker is eligible
-        let any_matching_cap = state.workers.values().any(|w| {
-          let pool_ok = match req.pool_id {
-            Some(ref p) => w.pool_id.as_deref() == Some(p.as_str()),
-            None => true,
-          };
-          pool_ok && w.capabilities.iter().any(|c| c == &req.capability)
-        });
-
-        if any_matching_cap {
-          return Err(WorkerError::new(
-            WorkerErrorCode::WorkerBusy,
-            "All eligible workers are currently leased, busy or reconciling",
-          ));
-        } else {
+    // Strict 1:1 Profile Pinning: If profile_id is provided, match exact profile only
+    let worker_id = if let Some(ref pid) = req.profile_id {
+      state
+        .workers
+        .values()
+        .find(|w| &w.profile_id == pid && w.state == WorkerState::Ready && w.extension_ready && w.grok_logged_in == Some(true) && w.current_lease_id.is_none())
+        .map(|w| w.worker_id.clone())
+        .ok_or_else(|| {
+          WorkerError::new(
+            WorkerErrorCode::NoAvailableWorker,
+            format!("Specified profile '{pid}' is not ready or does not exist"),
+          )
+        })?
+    } else {
+      match eligible_worker_id {
+        Some(id) => id,
+        None => {
+          // Check if any worker exists with this pool to provide accurate error code
+          if let Some(ref pool) = req.pool_id {
+            let pool_workers = state.workers.values().filter(|w| w.pool_id.as_deref() == Some(pool.as_str())).collect::<Vec<_>>();
+            if pool_workers.iter().any(|w| w.state == WorkerState::LoginRequired || w.grok_logged_in == Some(false)) {
+              return Err(WorkerError::new(WorkerErrorCode::GrokNotLoggedIn, "Worker in pool requires Grok login"));
+            }
+          }
           return Err(WorkerError::new(
             WorkerErrorCode::NoAvailableWorker,
-            "No worker found with requested capability",
+            "No ready workers available matching capability and pool requirements",
           ));
         }
       }
     };
 
-    let worker = state.workers.get_mut(&worker_id).unwrap();
     let lease_id = format!("LEASE_{}", Uuid::new_v4().simple());
     let ttl_secs = req.ttl_seconds.unwrap_or(120);
     let expires_at = (now + Duration::seconds(ttl_secs as i64)).to_rfc3339();
 
-    worker.state = WorkerState::Leased;
-    worker.current_lease_id = Some(lease_id.clone());
-    worker.current_job_id = Some(req.job_id.clone());
-    worker.last_heartbeat_at = Some(now.to_rfc3339());
+    let (worker_id_str, profile_id_str) = {
+      let worker = state.workers.get_mut(&worker_id).unwrap();
+      worker.state = WorkerState::Leased;
+      worker.current_lease_id = Some(lease_id.clone());
+      worker.current_job_id = Some(req.job_id.clone());
+      worker.last_heartbeat_at = Some(now.to_rfc3339());
+      (worker.worker_id.clone(), worker.profile_id.clone())
+    };
 
     let lease = WorkerLease {
       lease_id: lease_id.clone(),
-      worker_id: worker.worker_id.clone(),
-      profile_id: worker.profile_id.clone(),
+      worker_id: worker_id_str.clone(),
+      profile_id: profile_id_str.clone(),
       job_id: req.job_id,
       step_id: req.step_id,
       attempt_id: req.attempt_id,
@@ -420,8 +459,8 @@ impl WorkerRegistry {
 
     Ok(AcquireWorkerResponse {
       lease_id,
-      worker_id: worker.worker_id.clone(),
-      profile_id: worker.profile_id.clone(),
+      worker_id: worker_id_str,
+      profile_id: profile_id_str,
       expires_at,
     })
   }
@@ -430,33 +469,36 @@ impl WorkerRegistry {
   pub async fn heartbeat(&self, lease_id: &str, req: HeartbeatLeaseRequest) -> Result<HeartbeatLeaseResponse, WorkerError> {
     let mut state = self.state.lock().await;
 
-    let lease = state
-      .leases
-      .get_mut(lease_id)
-      .ok_or_else(|| WorkerError::new(WorkerErrorCode::LeaseNotFound, "Lease not found"))?;
-
-    if lease.status != LeaseStatus::Active {
-      return Err(WorkerError::new(
-        WorkerErrorCode::LeaseNotActive,
-        format!("Lease is not active: {:?}", lease.status),
-      ));
-    }
-
-    if lease.job_id != req.job_id || lease.attempt_id != req.attempt_id {
-      return Err(WorkerError::new(
-        WorkerErrorCode::CorrelationMismatch,
-        "Lease correlation mismatch for heartbeat",
-      ));
-    }
-
     let now = Utc::now();
     let ttl_secs = req.ttl_seconds.unwrap_or(60);
     let expires_at = (now + Duration::seconds(ttl_secs as i64)).to_rfc3339();
 
-    lease.expires_at = expires_at.clone();
-    lease.last_heartbeat_at = now.to_rfc3339();
+    let worker_id = {
+      let lease = state
+        .leases
+        .get_mut(lease_id)
+        .ok_or_else(|| WorkerError::new(WorkerErrorCode::LeaseNotFound, "Lease not found"))?;
 
-    if let Some(w) = state.workers.get_mut(&lease.worker_id) {
+      if lease.status != LeaseStatus::Active {
+        return Err(WorkerError::new(
+          WorkerErrorCode::LeaseNotActive,
+          format!("Lease is not active: {:?}", lease.status),
+        ));
+      }
+
+      if lease.job_id != req.job_id || lease.attempt_id != req.attempt_id {
+        return Err(WorkerError::new(
+          WorkerErrorCode::CorrelationMismatch,
+          "Lease correlation mismatch for heartbeat",
+        ));
+      }
+
+      lease.expires_at = expires_at.clone();
+      lease.last_heartbeat_at = now.to_rfc3339();
+      lease.worker_id.clone()
+    };
+
+    if let Some(w) = state.workers.get_mut(&worker_id) {
       w.last_heartbeat_at = Some(now.to_rfc3339());
     }
 
@@ -551,9 +593,15 @@ impl WorkerRegistry {
   pub async fn release(&self, lease_id: &str) -> ReleaseLeaseResponse {
     let mut state = self.state.lock().await;
 
-    if let Some(lease) = state.leases.get_mut(lease_id) {
+    let worker_id_opt = if let Some(lease) = state.leases.get_mut(lease_id) {
       lease.status = LeaseStatus::Released;
-      if let Some(w) = state.workers.get_mut(&lease.worker_id) {
+      Some(lease.worker_id.clone())
+    } else {
+      None
+    };
+
+    if let Some(ref worker_id) = worker_id_opt {
+      if let Some(w) = state.workers.get_mut(worker_id) {
         if w.current_lease_id.as_deref() == Some(lease_id) {
           w.current_lease_id = None;
           w.current_job_id = None;
@@ -570,55 +618,6 @@ impl WorkerRegistry {
       lease_id: lease_id.to_string(),
       status: LeaseStatus::Released,
     }
-  }
-
-  /// Explicit worker reconciliation: Called after health probe confirms worker state.
-  pub async fn reconcile_worker(
-    &self,
-    worker_id: &str,
-    is_idle: bool,
-    is_healthy: bool,
-    grok_logged_in: Option<bool>,
-  ) -> Result<WorkerState, WorkerError> {
-    let mut state = self.state.lock().await;
-
-    let worker = state
-      .workers
-      .get_mut(worker_id)
-      .or_else(|| state.workers.values_mut().find(|w| w.profile_id == worker_id))
-      .ok_or_else(|| {
-        WorkerError::new(
-          WorkerErrorCode::NoAvailableWorker,
-          format!("Worker {worker_id} not found"),
-        )
-      })?;
-
-    if !is_healthy {
-      worker.state = WorkerState::Error;
-      return Ok(WorkerState::Error);
-    }
-
-    if let Some(logged_in) = grok_logged_in {
-      worker.grok_logged_in = Some(logged_in);
-      if !logged_in {
-        worker.state = WorkerState::LoginRequired;
-        return Ok(WorkerState::LoginRequired);
-      }
-    }
-
-    if !is_idle {
-      worker.state = WorkerState::Busy;
-      return Ok(WorkerState::Busy);
-    }
-
-    // Only transition to READY if no active lease is held
-    if worker.current_lease_id.is_none() && worker.grok_logged_in.unwrap_or(false) && worker.extension_ready {
-      worker.state = WorkerState::Ready;
-    } else if worker.current_lease_id.is_some() {
-      worker.state = WorkerState::Leased;
-    }
-
-    Ok(worker.state.clone())
   }
 
   /// Reconcile and recover active leases from persistent store after daemon restart.

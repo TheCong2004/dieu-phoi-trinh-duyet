@@ -13,7 +13,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-pub fn worker_routes() -> Router {
+pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
   Router::new()
     .route("/v1/workers/acquire", post(acquire_worker_handler))
     .route(
@@ -261,7 +261,7 @@ pub async fn dispatch_to_profile_extension(
   // 1. Strict profile ID match (no display name fallback)
   let profile = profiles
     .into_iter()
-    .find(|p| p.id == profile_id)
+    .find(|p| p.id.to_string() == profile_id)
     .ok_or_else(|| WorkerError::new(WorkerErrorCode::InvalidProfile, format!("Profile ID '{profile_id}' not found in runtime")))?;
 
   let profile_path = profile.get_profile_data_path(&profiles_dir);
