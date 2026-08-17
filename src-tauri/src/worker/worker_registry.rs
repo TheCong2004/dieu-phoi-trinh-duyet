@@ -398,6 +398,52 @@ impl WorkerRegistry {
     })
   }
 
+  /// Validates that an active lease exists and matches the exact correlation identity for dispatch.
+  pub async fn validate_active_lease(
+    &self,
+    lease_id: &str,
+    job_id: &str,
+    step_id: &str,
+    attempt_id: &str,
+    profile_id: &str,
+  ) -> Result<WorkerLease, WorkerError> {
+    let state = self.state.lock().await;
+
+    let lease = state
+      .leases
+      .get(lease_id)
+      .ok_or_else(|| WorkerError::new(WorkerErrorCode::LeaseNotFound, format!("Lease '{lease_id}' not found")))?;
+
+    if lease.status != LeaseStatus::Active {
+      return Err(WorkerError::new(
+        WorkerErrorCode::LeaseNotActive,
+        format!("Lease '{lease_id}' is not active: {:?}", lease.status),
+      ));
+    }
+
+    if lease.job_id != job_id || lease.step_id != step_id || lease.attempt_id != attempt_id {
+      return Err(WorkerError::new(
+        WorkerErrorCode::CorrelationMismatch,
+        format!(
+          "Lease correlation mismatch. Expected job={}, step={}, attempt={}; got job={}, step={}, attempt={}",
+          lease.job_id, lease.step_id, lease.attempt_id, job_id, step_id, attempt_id
+        ),
+      ));
+    }
+
+    if lease.profile_id != profile_id && lease.worker_id != profile_id {
+      return Err(WorkerError::new(
+        WorkerErrorCode::InvalidProfile,
+        format!(
+          "Lease profile mismatch: lease profile={}, requested profile={}",
+          lease.profile_id, profile_id
+        ),
+      ));
+    }
+
+    Ok(lease.clone())
+  }
+
   /// Safe release: Released lease moves worker to RECONCILING (NOT immediately READY).
   pub async fn release(&self, lease_id: &str) -> ReleaseLeaseResponse {
     let mut state = self.state.lock().await;
@@ -1104,6 +1150,54 @@ mod tests {
     assert!(corrupt_file.exists());
     let _ = fs::remove_dir_all(&temp_dir);
   }
+
+  #[tokio::test]
+  async fn test_validate_active_lease_exact_matches_success() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+
+    let acq = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_100".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await.unwrap();
+
+    let res = registry.validate_active_lease(&acq.lease_id, "JOB_100", "GENERATING_IMAGE", "ATTEMPT_001", "PROFILE_A").await;
+    assert!(res.is_ok());
+  }
+
+  #[tokio::test]
+  async fn test_validate_active_lease_mismatches_fail() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+
+    let acq = registry.acquire(AcquireWorkerRequest {
+      job_id: "JOB_100".to_string(),
+      step_id: "GENERATING_IMAGE".to_string(),
+      attempt_id: "ATTEMPT_001".to_string(),
+      capability: "grok.image.edit".to_string(),
+      pool_id: None,
+      ttl_seconds: Some(120),
+    }).await.unwrap();
+
+    // Wrong job -> fail
+    let err_job = registry.validate_active_lease(&acq.lease_id, "JOB_WRONG", "GENERATING_IMAGE", "ATTEMPT_001", "PROFILE_A").await;
+    assert!(err_job.is_err());
+    assert_eq!(err_job.unwrap_err().code, WorkerErrorCode::CorrelationMismatch);
+
+    // Wrong profile -> fail
+    let err_prof = registry.validate_active_lease(&acq.lease_id, "JOB_100", "GENERATING_IMAGE", "ATTEMPT_001", "PROFILE_WRONG").await;
+    assert!(err_prof.is_err());
+    assert_eq!(err_prof.unwrap_err().code, WorkerErrorCode::InvalidProfile);
+
+    // Released lease -> fail
+    registry.release(&acq.lease_id).await;
+    let err_rel = registry.validate_active_lease(&acq.lease_id, "JOB_100", "GENERATING_IMAGE", "ATTEMPT_001", "PROFILE_A").await;
+    assert!(err_rel.is_err());
+    assert_eq!(err_rel.unwrap_err().code, WorkerErrorCode::LeaseNotActive);
+  }
 }
 
-}
