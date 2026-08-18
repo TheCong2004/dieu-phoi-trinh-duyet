@@ -1,7 +1,6 @@
 use super::worker_types::*;
 use chrono::{DateTime, Duration, Utc};
 use lazy_static::lazy_static;
-use log::{error, info, warn};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -419,6 +418,16 @@ impl WorkerRegistry {
               return Err(WorkerError::new(WorkerErrorCode::GrokNotLoggedIn, "Worker in pool requires Grok login"));
             }
           }
+          // Check if matching capability workers exist but are currently busy/leased/reconciling
+          let matching_cap_busy = state.workers.values().any(|w| {
+            w.capabilities.contains(&req.capability) && (w.state == WorkerState::Busy || w.state == WorkerState::Leased || w.state == WorkerState::Reconciling || w.current_lease_id.is_some())
+          });
+          if matching_cap_busy {
+            return Err(WorkerError::new(
+              WorkerErrorCode::WorkerBusy,
+              "Matching workers are currently busy or leased",
+            ));
+          }
           return Err(WorkerError::new(
             WorkerErrorCode::NoAvailableWorker,
             "No ready workers available matching capability and pool requirements",
@@ -688,7 +697,7 @@ impl WorkerRegistry {
 mod tests {
   use super::*;
 
-  fn seed_test_worker(registry: &WorkerRegistry, worker_id: &str, profile_id: &str, pool_id: Option<&str>) {
+  async fn seed_test_worker(registry: &WorkerRegistry, worker_id: &str, profile_id: &str, pool_id: Option<&str>) {
     let worker = BrowserWorker {
       worker_id: worker_id.to_string(),
       profile_id: profile_id.to_string(),
@@ -707,7 +716,7 @@ mod tests {
       last_heartbeat_at: Some(Utc::now().to_rfc3339()),
       last_error: None,
     };
-    let mut state = registry.state.blocking_lock();
+    let mut state = registry.state.lock().await;
     state.is_ready = true;
     state.workers.insert(worker_id.to_string(), worker);
   }
@@ -777,7 +786,7 @@ mod tests {
   #[tokio::test]
   async fn test_04_profile_mismatch_fails() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None).await;
 
     let err = registry.handle_health_handshake("browser-profile:PROFILE_A", WorkerHealthHandshakeRequest {
       profile_id: "PROFILE_B".to_string(),
@@ -798,7 +807,7 @@ mod tests {
   #[tokio::test]
   async fn test_05_protocol_mismatch_fails() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "browser-profile:PROFILE_A", "PROFILE_A", None).await;
 
     let err = registry.handle_health_handshake("browser-profile:PROFILE_A", WorkerHealthHandshakeRequest {
       profile_id: "PROFILE_A".to_string(),
@@ -816,7 +825,7 @@ mod tests {
   #[tokio::test]
   async fn test_06_release_moves_worker_to_reconciling() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     let res = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_001".to_string(),
@@ -824,6 +833,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -838,7 +848,7 @@ mod tests {
   #[tokio::test]
   async fn test_07_health_idle_after_release_transitions_to_ready() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     let res = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_001".to_string(),
@@ -846,6 +856,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -869,7 +880,7 @@ mod tests {
   #[tokio::test]
   async fn test_08_health_busy_after_release_remains_non_schedulable() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     let res = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_001".to_string(),
@@ -877,6 +888,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -892,9 +904,11 @@ mod tests {
       capabilities: vec!["grok.image.edit".to_string()],
     }).await.unwrap();
 
-    let state = registry.state.lock().await;
-    let w = state.workers.get("WORKER_01").unwrap();
-    assert_eq!(w.state, WorkerState::Busy);
+    {
+      let state = registry.state.lock().await;
+      let w = state.workers.get("WORKER_01").unwrap();
+      assert_eq!(w.state, WorkerState::Busy);
+    }
 
     // Cannot acquire busy worker
     let err = registry.acquire(AcquireWorkerRequest {
@@ -903,6 +917,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
     assert!(err.is_err());
@@ -912,7 +927,7 @@ mod tests {
   #[tokio::test]
   async fn test_09_logout_after_release_sets_login_required() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     let res = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_001".to_string(),
@@ -920,6 +935,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -943,7 +959,7 @@ mod tests {
   #[tokio::test]
   async fn test_10_startup_active_lease_recovery_prevents_double_lease() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None).await;
 
     let active_lease = WorkerLease {
       lease_id: "LEASE_PERSISTED_A".to_string(),
@@ -969,6 +985,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
 
@@ -979,7 +996,7 @@ mod tests {
   #[tokio::test]
   async fn test_11_startup_recovered_busy_extension_retains_ownership() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None).await;
 
     let active_lease = WorkerLease {
       lease_id: "LEASE_A".to_string(),
@@ -1015,7 +1032,7 @@ mod tests {
   #[tokio::test]
   async fn test_12_startup_recovered_idle_extension_terminalizes_stale_lease_safely() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None).await;
 
     let active_lease = WorkerLease {
       lease_id: "LEASE_A".to_string(),
@@ -1054,7 +1071,7 @@ mod tests {
   #[tokio::test]
   async fn test_13_recovered_lease_wrong_profile_fails() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_A", "PROFILE_A", None).await;
 
     let err = registry.handle_health_handshake("WORKER_A", WorkerHealthHandshakeRequest {
       profile_id: "PROFILE_WRONG".to_string(),
@@ -1072,7 +1089,7 @@ mod tests {
   #[tokio::test]
   async fn test_14_100_acquire_release_reconcile_sequential_cycles_no_deadlock() {
     let registry = Arc::new(WorkerRegistry::new());
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     for i in 0..100 {
       let res = registry.acquire(AcquireWorkerRequest {
@@ -1081,6 +1098,7 @@ mod tests {
         attempt_id: "ATTEMPT_001".to_string(),
         capability: "grok.image.edit".to_string(),
         pool_id: None,
+        profile_id: None,
         ttl_seconds: Some(120),
       }).await.unwrap();
 
@@ -1096,7 +1114,7 @@ mod tests {
   #[tokio::test]
   async fn test_15_double_acquire_without_release_returns_worker_busy() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_GROK_01", None).await;
 
     let _res1 = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_A".to_string(),
@@ -1104,6 +1122,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -1113,6 +1132,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
 
@@ -1123,7 +1143,7 @@ mod tests {
   #[tokio::test]
   async fn test_16_sequential_reuse_different_jobs() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
 
     // Job 1 acquires
     let res1 = registry.acquire(AcquireWorkerRequest {
@@ -1132,6 +1152,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
     assert_eq!(res1.profile_id, "PROFILE_A");
@@ -1156,6 +1177,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
     assert_eq!(res2.profile_id, "PROFILE_A");
@@ -1175,6 +1197,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
 
@@ -1187,7 +1210,7 @@ mod tests {
   #[tokio::test]
   async fn test_d2_load_persisted_active_lease_denies_acquire_same_profile() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_ACTIVE", "PROFILE_PERSISTED", None);
+    seed_test_worker(&registry, "WORKER_ACTIVE", "PROFILE_PERSISTED", None).await;
 
     let active_lease = WorkerLease {
       lease_id: "LEASE_PERSISTED_001".to_string(),
@@ -1212,6 +1235,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
 
@@ -1222,7 +1246,7 @@ mod tests {
   #[tokio::test]
   async fn test_d3_registry_ready_allows_eligible_acquire() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_READY", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_READY", None).await;
     registry.mark_ready().await;
 
     let res = registry.acquire(AcquireWorkerRequest {
@@ -1231,6 +1255,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await;
 
@@ -1256,7 +1281,7 @@ mod tests {
   #[tokio::test]
   async fn test_validate_active_lease_exact_matches_success() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
 
     let acq = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_100".to_string(),
@@ -1264,6 +1289,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
@@ -1274,7 +1300,7 @@ mod tests {
   #[tokio::test]
   async fn test_validate_active_lease_mismatches_fail() {
     let registry = WorkerRegistry::new();
-    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None);
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
 
     let acq = registry.acquire(AcquireWorkerRequest {
       job_id: "JOB_100".to_string(),
@@ -1282,6 +1308,7 @@ mod tests {
       attempt_id: "ATTEMPT_001".to_string(),
       capability: "grok.image.edit".to_string(),
       pool_id: None,
+      profile_id: None,
       ttl_seconds: Some(120),
     }).await.unwrap();
 
