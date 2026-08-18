@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "kill-port": "node scripts/kill-port.mjs",
-    "predev": "pnpm kill-port && pnpm licenses:generate",
-    "dev": "next dev --turbopack -p 12341",
+    "predev": "pnpm kill-port",
+    "dev": "next dev --webpack -p 12341",
     "prebuild": "pnpm licenses:generate",
     "build": "next build",
     "start": "next start",

@@ -61,6 +61,16 @@ function copyBinary(baseName) {
   if (isWindows) destName += ".exe";
   const dest = join(destDir, destName);
 
+  if (PROFILE === "debug" && existsSync(dest) && !process.env.FORCE_BUILD_PROXY) {
+    if (existsSync(source)) {
+      try {
+        copyFileSync(source, dest);
+      } catch {}
+    }
+    console.log(`Using existing ${destName}`);
+    return;
+  }
+
   const buildArgs = ["build", "--bin", baseName];
   if (PROFILE === "release") buildArgs.push("--release");
   if (TARGET !== "unknown" && TARGET !== HOST_TARGET) {

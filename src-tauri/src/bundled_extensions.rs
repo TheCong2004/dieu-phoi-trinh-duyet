@@ -47,10 +47,7 @@ pub fn ensure_unpacked<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
   }
 }
 
-fn ensure_one_unpacked(
-  zip_path: &Path,
-  dir_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_one_unpacked(zip_path: &Path, dir_name: &str) -> Result<(), Box<dyn std::error::Error>> {
   let data = fs::read(zip_path)?;
   let hash = blake3::hash(&data).to_hex().to_string();
 
@@ -233,6 +230,10 @@ mod tests {
     );
 
     fs::write(dest.join(HASH_MARKER), b"deadbeef").unwrap();
-    assert_eq!(loadable_paths().len(), 1, "marker present makes it loadable");
+    assert_eq!(
+      loadable_paths().len(),
+      1,
+      "marker present makes it loadable"
+    );
   }
 }

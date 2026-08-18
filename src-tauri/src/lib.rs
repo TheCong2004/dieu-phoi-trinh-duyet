@@ -2382,51 +2382,20 @@ pub fn run_with_builder(
 
       // Nodecar warm-up is now triggered from the frontend to allow UI blocking overlay
 
-      // Start API server if enabled in settings
+      // Start Local API & Worker server on startup (always active on port 10108 or configured api_port)
       let app_handle_api = app.handle().clone();
       tauri::async_runtime::spawn(async move {
-        match crate::settings_manager::get_app_settings(app_handle_api.clone()).await {
-          Ok(settings) => {
-            if settings.api_enabled {
-              log::info!("API is enabled in settings, starting API server...");
-              match crate::api_server::start_api_server_internal(settings.api_port, &app_handle_api)
-                .await
-              {
-                Ok(port) => {
-                  log::info!("API server started successfully on port {port}");
-                  // Emit success toast to frontend
-                  if let Err(e) = events::emit(
-                    "show-toast",
-                    crate::api_server::ToastPayload {
-                      message: "API server started successfully".to_string(),
-                      variant: "success".to_string(),
-                      title: "Local API Started".to_string(),
-                      description: Some(format!("API server running on port {port}")),
-                    },
-                  ) {
-                    log::error!("Failed to emit API start toast: {e}");
-                  }
-                }
-                Err(e) => {
-                  log::error!("Failed to start API server at startup: {e}");
-                  // Emit error toast to frontend
-                  if let Err(toast_err) = events::emit(
-                    "show-toast",
-                    crate::api_server::ToastPayload {
-                      message: "Failed to start API server".to_string(),
-                      variant: "error".to_string(),
-                      title: "Failed to Start Local API".to_string(),
-                      description: Some(format!("Error: {e}")),
-                    },
-                  ) {
-                    log::error!("Failed to emit API error toast: {toast_err}");
-                  }
-                }
-              }
-            }
+        let port = crate::settings_manager::SettingsManager::instance()
+          .load_settings()
+          .map(|s| s.api_port)
+          .unwrap_or(10108);
+        log::info!("Starting Local API server on port {port}...");
+        match crate::api_server::start_api_server_internal(port, &app_handle_api).await {
+          Ok(actual_port) => {
+            log::info!("Local API server started successfully on port {actual_port}");
           }
           Err(e) => {
-            log::error!("Failed to load app settings for API startup: {e}");
+            log::error!("Failed to start Local API server on port {port}: {e}");
           }
         }
       });

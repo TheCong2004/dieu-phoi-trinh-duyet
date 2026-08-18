@@ -85,7 +85,7 @@ impl Default for AppSettings {
       set_as_default_browser: false,
       theme: "system".to_string(),
       custom_theme: None,
-      api_enabled: false,
+      api_enabled: true,
       api_port: 10108,
       api_token: None,
       sync_server_url: None,

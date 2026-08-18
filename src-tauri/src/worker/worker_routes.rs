@@ -17,23 +17,23 @@ pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
   Router::new()
     .route("/v1/workers/acquire", post(acquire_worker_handler))
     .route(
-      "/v1/workers/leases/:lease_id/heartbeat",
+      "/v1/workers/leases/{lease_id}/heartbeat",
       post(heartbeat_lease_handler),
     )
     .route(
-      "/v1/workers/leases/:lease_id/release",
+      "/v1/workers/leases/{lease_id}/release",
       post(release_lease_handler),
     )
     .route(
-      "/v1/workers/:worker_id/reconcile",
+      "/v1/workers/{worker_id}/reconcile",
       post(reconcile_worker_handler),
     )
     .route(
-      "/v1/workers/:worker_id/health",
+      "/v1/workers/{worker_id}/health",
       post(worker_health_handshake_handler),
     )
     .route(
-      "/v1/workers/:worker_id/dispatch",
+      "/v1/workers/{worker_id}/dispatch",
       post(dispatch_worker_handler),
     )
     .route("/v1/workers", get(list_workers_handler))
@@ -46,7 +46,8 @@ pub async fn acquire_worker_handler(
   match WORKER_REGISTRY.acquire(payload).await {
     Ok(res) => Ok(Json(res)),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
       Err((
         status,
         Json(serde_json::json!({
@@ -67,7 +68,8 @@ pub async fn heartbeat_lease_handler(
   match WORKER_REGISTRY.heartbeat(&lease_id, payload).await {
     Ok(res) => Ok(Json(res)),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
       Err((
         status,
         Json(serde_json::json!({
@@ -81,9 +83,7 @@ pub async fn heartbeat_lease_handler(
   }
 }
 
-pub async fn release_lease_handler(
-  Path(lease_id): Path<String>,
-) -> impl IntoResponse {
+pub async fn release_lease_handler(Path(lease_id): Path<String>) -> impl IntoResponse {
   let res = WORKER_REGISTRY.release(&lease_id).await;
 
   // Trigger background health probe after release to reconcile to Ready if IDLE
@@ -93,7 +93,9 @@ pub async fn release_lease_handler(
     let worker_id = lease.worker_id.clone();
     tauri::async_runtime::spawn(async move {
       if let Ok(handshake) = probe_worker_health(&profile_id).await {
-        let _ = WORKER_REGISTRY.handle_health_handshake(&worker_id, handshake).await;
+        let _ = WORKER_REGISTRY
+          .handle_health_handshake(&worker_id, handshake)
+          .await;
       }
     });
   }
@@ -106,7 +108,12 @@ pub async fn reconcile_worker_handler(
   Json(payload): Json<ReconcileWorkerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
   match WORKER_REGISTRY
-    .reconcile_worker(&worker_id, payload.is_idle, payload.is_healthy, payload.grok_logged_in)
+    .reconcile_worker(
+      &worker_id,
+      payload.is_idle,
+      payload.is_healthy,
+      payload.grok_logged_in,
+    )
     .await
   {
     Ok(state) => Ok(Json(serde_json::json!({
@@ -114,7 +121,8 @@ pub async fn reconcile_worker_handler(
       "state": state
     }))),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
       Err((
         status,
         Json(serde_json::json!({
@@ -132,13 +140,17 @@ pub async fn worker_health_handshake_handler(
   Path(worker_id): Path<String>,
   Json(payload): Json<WorkerHealthHandshakeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-  match WORKER_REGISTRY.handle_health_handshake(&worker_id, payload).await {
+  match WORKER_REGISTRY
+    .handle_health_handshake(&worker_id, payload)
+    .await
+  {
     Ok(()) => Ok(Json(serde_json::json!({
       "worker_id": worker_id,
       "status": "HANDSHAKE_ACCEPTED"
     }))),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
       Err((
         status,
         Json(serde_json::json!({
@@ -161,7 +173,9 @@ pub async fn list_leases_handler() -> Json<ListLeasesResponse> {
 }
 
 async fn send_cdp_evaluate(
-  ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+  ws_stream: &mut tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+  >,
   cmd_id: u64,
   expression: &str,
   context_id: i64,
@@ -183,7 +197,12 @@ async fn send_cdp_evaluate(
   ws_stream
     .send(Message::Text(cdp_req.to_string().into()))
     .await
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to send CDP evaluate: {e}")))?;
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Failed to send CDP evaluate: {e}"),
+      )
+    })?;
 
   let wait_fut = async {
     while let Some(msg) = ws_stream.next().await {
@@ -256,13 +275,23 @@ pub async fn dispatch_to_profile_extension(
   let profiles_dir = crate::profile::ProfileManager::instance().get_profiles_dir();
   let profiles = crate::profile::ProfileManager::instance()
     .list_profiles()
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to list profiles: {e}")))?;
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Failed to list profiles: {e}"),
+      )
+    })?;
 
   // 1. Strict profile ID match (no display name fallback)
   let profile = profiles
     .into_iter()
     .find(|p| p.id.to_string() == profile_id)
-    .ok_or_else(|| WorkerError::new(WorkerErrorCode::InvalidProfile, format!("Profile ID '{profile_id}' not found in runtime")))?;
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidProfile,
+        format!("Profile ID '{profile_id}' not found in runtime"),
+      )
+    })?;
 
   let profile_path = profile.get_profile_data_path(&profiles_dir);
   let profile_path_str = profile_path.to_string_lossy();
@@ -283,16 +312,19 @@ pub async fn dispatch_to_profile_extension(
     .build()
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
 
-  let targets_resp = http_client
-    .get(&url)
-    .send()
-    .await
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("CDP endpoint unavailable: {e}")))?;
+  let targets_resp = http_client.get(&url).send().await.map_err(|e| {
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("CDP endpoint unavailable: {e}"),
+    )
+  })?;
 
-  let targets: Vec<serde_json::Value> = targets_resp
-    .json()
-    .await
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to parse CDP targets: {e}")))?;
+  let targets: Vec<serde_json::Value> = targets_resp.json().await.map_err(|e| {
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Failed to parse CDP targets: {e}"),
+    )
+  })?;
 
   // 2. Strict grok.com page target selection with multi-tab guard
   let grok_targets: Vec<&serde_json::Value> = targets
@@ -307,7 +339,9 @@ pub async fn dispatch_to_profile_extension(
   if grok_targets.is_empty() {
     return Err(WorkerError::new(
       WorkerErrorCode::GrokPageNotReady,
-      format!("No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."),
+      format!(
+        "No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."
+      ),
     ));
   }
 
@@ -332,16 +366,21 @@ pub async fn dispatch_to_profile_extension(
       )
     })?;
 
-  let (mut ws_stream, _) = connect_async(ws_url)
-    .await
-    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to connect to CDP WS: {e}")))?;
+  let (mut ws_stream, _) = connect_async(ws_url).await.map_err(|e| {
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Failed to connect to CDP WS: {e}"),
+    )
+  })?;
 
   // 3. Discover Execution Contexts via Runtime.enable
   let enable_req = serde_json::json!({
     "id": 1,
     "method": "Runtime.enable"
   });
-  let _ = ws_stream.send(Message::Text(enable_req.to_string().into())).await;
+  let _ = ws_stream
+    .send(Message::Text(enable_req.to_string().into()))
+    .await;
 
   // Drain initial context creation events (up to 500ms timeout)
   let mut isolated_context_ids = Vec::new();
@@ -353,7 +392,11 @@ pub async fn dispatch_to_profile_extension(
           if event.get("method") == Some(&serde_json::json!("Runtime.executionContextCreated")) {
             if let Some(ctx) = event.get("params").and_then(|p| p.get("context")) {
               if let Some(cid) = ctx.get("id").and_then(|v| v.as_i64()) {
-                let is_default = ctx.get("auxiliaryData").and_then(|a| a.get("isDefault")).and_then(|v| v.as_bool()).unwrap_or(true);
+                let is_default = ctx
+                  .get("auxiliaryData")
+                  .and_then(|a| a.get("isDefault"))
+                  .and_then(|v| v.as_bool())
+                  .unwrap_or(true);
                 if !is_default {
                   isolated_context_ids.push(cid);
                 }
@@ -379,7 +422,15 @@ pub async fn dispatch_to_profile_extension(
 
   let mut target_context_id: Option<i64> = None;
   for cid in isolated_context_ids.iter().copied() {
-    if let Ok(res) = send_cdp_evaluate(&mut ws_stream, 10 + cid as u64, &bind_expr, cid, Duration::from_secs(5)).await {
+    if let Ok(res) = send_cdp_evaluate(
+      &mut ws_stream,
+      10 + cid as u64,
+      &bind_expr,
+      cid,
+      Duration::from_secs(5),
+    )
+    .await
+    {
       if res.as_bool() == Some(true) {
         target_context_id = Some(cid);
         break;
@@ -391,13 +442,18 @@ pub async fn dispatch_to_profile_extension(
   let target_context_id = target_context_id.ok_or_else(|| {
     WorkerError::new(
       WorkerErrorCode::ExtensionContextNotFound,
-      format!("Extension isolated execution context not found on grok.com for profile '{profile_id}'"),
+      format!(
+        "Extension isolated execution context not found on grok.com for profile '{profile_id}'"
+      ),
     )
   })?;
 
   // 5. Execute production command directly in verified isolated context
   let payload_json_str = serde_json::to_string(payload).map_err(|e| {
-    WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Failed to serialize payload: {e}"))
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Failed to serialize payload: {e}"),
+    )
   })?;
 
   let exec_expr = format!(
@@ -426,12 +482,21 @@ pub async fn dispatch_to_profile_extension(
     .unwrap_or(180_000);
   let method_dur = Duration::from_millis(timeout_ms + 5_000);
 
-  let prod_result = send_cdp_evaluate(&mut ws_stream, 1001, &exec_expr, target_context_id, method_dur).await?;
+  let prod_result = send_cdp_evaluate(
+    &mut ws_stream,
+    1001,
+    &exec_expr,
+    target_context_id,
+    method_dur,
+  )
+  .await?;
   Ok(prod_result)
 }
 
 /// Active health probe from Donut Browser to Extension instance with zero fake fallbacks.
-pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandshakeRequest, WorkerError> {
+pub async fn probe_worker_health(
+  profile_id: &str,
+) -> Result<WorkerHealthHandshakeRequest, WorkerError> {
   let health_req = serde_json::json!({
     "protocol": "floword-production",
     "protocolVersion": 1,
@@ -451,7 +516,10 @@ pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandsha
   let res = dispatch_to_profile_extension(profile_id, &health_req).await?;
 
   let proto = res.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
-  let proto_ver = res.get("protocolVersion").and_then(|v| v.as_u64()).unwrap_or(0);
+  let proto_ver = res
+    .get("protocolVersion")
+    .and_then(|v| v.as_u64())
+    .unwrap_or(0);
   if proto != "floword-production" || proto_ver != 1 {
     return Err(WorkerError::new(
       WorkerErrorCode::ProtocolMismatch,
@@ -466,7 +534,10 @@ pub async fn probe_worker_health(profile_id: &str) -> Result<WorkerHealthHandsha
     )
   })?;
 
-  let resp_profile = health_val.get("profileId").and_then(|v| v.as_str()).unwrap_or("");
+  let resp_profile = health_val
+    .get("profileId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
   if resp_profile != profile_id {
     return Err(WorkerError::new(
       WorkerErrorCode::InvalidProfile,
@@ -542,12 +613,24 @@ pub async fn dispatch_worker_handler(
   Path(worker_id): Path<String>,
   Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-  let profile_id = payload.get("profileId").and_then(|v| v.as_str()).unwrap_or_default();
-  let req_id = payload.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+  let profile_id = payload
+    .get("profileId")
+    .and_then(|v| v.as_str())
+    .unwrap_or_default();
+  let req_id = payload
+    .get("requestId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
   let job_id = payload.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
   let step_id = payload.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
-  let attempt_id = payload.get("attemptId").and_then(|v| v.as_str()).unwrap_or("");
-  let lease_id = payload.get("leaseId").and_then(|v| v.as_str()).unwrap_or("");
+  let attempt_id = payload
+    .get("attemptId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  let lease_id = payload
+    .get("leaseId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
 
   // 1. Exact profile identity check
   if worker_id != profile_id && worker_id != format!("browser-profile:{profile_id}") {
@@ -563,7 +646,10 @@ pub async fn dispatch_worker_handler(
   }
 
   // 2. Strict Active Lease Validation (Two-way Lease <-> Worker cross check)
-  if let Err(err) = WORKER_REGISTRY.validate_active_lease(lease_id, job_id, step_id, attempt_id, profile_id).await {
+  if let Err(err) = WORKER_REGISTRY
+    .validate_active_lease(lease_id, job_id, step_id, attempt_id, profile_id)
+    .await
+  {
     let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::CONFLICT);
     return Err((
       status,
@@ -579,10 +665,9 @@ pub async fn dispatch_worker_handler(
   // 3. Worker State Check
   let is_available = {
     let workers = WORKER_REGISTRY.list_workers().await;
-    workers
-      .workers
-      .iter()
-      .any(|w| (w.worker_id == worker_id || w.profile_id == profile_id) && w.state != WorkerState::Offline)
+    workers.workers.iter().any(|w| {
+      (w.worker_id == worker_id || w.profile_id == profile_id) && w.state != WorkerState::Offline
+    })
   };
 
   if !is_available {
@@ -601,7 +686,8 @@ pub async fn dispatch_worker_handler(
   match dispatch_to_profile_extension(profile_id, &payload).await {
     Ok(result) => Ok(Json(result)),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
       Err((
         status,
         Json(serde_json::json!({
