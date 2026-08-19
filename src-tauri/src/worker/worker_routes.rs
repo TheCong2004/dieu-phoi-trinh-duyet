@@ -38,6 +38,7 @@ pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     )
     .route("/v1/workers", get(list_workers_handler))
     .route("/v1/workers/leases", get(list_leases_handler))
+    .route("/v1/publications/verify", post(verify_publication_handler))
 }
 
 pub async fn acquire_worker_handler(
@@ -172,6 +173,19 @@ pub async fn list_leases_handler() -> Json<ListLeasesResponse> {
   Json(WORKER_REGISTRY.list_leases().await)
 }
 
+pub async fn verify_publication_handler(
+  Json(_payload): Json<VerifyPublicationRequest>,
+) -> Json<VerifyPublicationResponse> {
+  // Section 18 / Section 56: In this foundation phase, publication verification is not yet implemented.
+  // Must return verified: false with status: "CAPABILITY_UNAVAILABLE" (never verified: true without evidence).
+  Json(VerifyPublicationResponse {
+    verified: false,
+    status: "CAPABILITY_UNAVAILABLE".to_string(),
+    reason: "Social post verification is not implemented in current runtime phase".to_string(),
+    details: None,
+  })
+}
+
 async fn send_cdp_evaluate(
   ws_stream: &mut tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -268,10 +282,35 @@ async fn send_cdp_evaluate(
 }
 
 /// Dispatches a Floword production command to the exact target browser profile extension via CDP isolated context.
+/// Multi-site aware: Routes to the appropriate site tab (Grok, Facebook, TikTok, YouTube Studio) based on method.
 pub async fn dispatch_to_profile_extension(
   profile_id: &str,
   payload: &serde_json::Value,
 ) -> Result<serde_json::Value, WorkerError> {
+  let method = payload
+    .get("method")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+
+  let descriptor = ProductionMethodDescriptor::lookup(method);
+
+  // If method is a known social publish command that is not yet implemented, fail closed with CAPABILITY_UNAVAILABLE
+  if let Some(ref desc) = descriptor {
+    if !desc.implemented {
+      return Err(WorkerError::new(
+        WorkerErrorCode::CapabilityUnavailable,
+        format!(
+          "Method '{method}' is recognized but executor is not implemented in current runtime phase"
+        ),
+      ));
+    }
+  }
+
+  let site = descriptor
+    .as_ref()
+    .map(|d| d.site)
+    .unwrap_or(ProductionSite::Grok);
+
   let profiles_dir = crate::profile::ProfileManager::instance().get_profiles_dir();
   let profiles = crate::profile::ProfileManager::instance()
     .list_profiles()
@@ -326,36 +365,47 @@ pub async fn dispatch_to_profile_extension(
     )
   })?;
 
-  // 2. Strict grok.com page target selection with multi-tab guard
-  let grok_targets: Vec<&serde_json::Value> = targets
+  // 2. Strict target selection with safe hostname boundary matching and multi-tab guard
+  let matching_targets: Vec<&serde_json::Value> = targets
     .iter()
     .filter(|t| {
       let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-      let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
-      t_type == "page" && t_url.contains("grok.com")
+      if t_type != "page" {
+        return false;
+      }
+      let t_url_str = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+      if let Ok(parsed_url) = url::Url::parse(t_url_str) {
+        if let Some(host) = parsed_url.host_str() {
+          return site.matches_host(host);
+        }
+      }
+      false
     })
     .collect();
 
-  if grok_targets.is_empty() {
+  if matching_targets.is_empty() {
     return Err(WorkerError::new(
-      WorkerErrorCode::GrokPageNotReady,
+      WorkerErrorCode::TargetNotFound,
       format!(
-        "No active grok.com page target found for profile '{profile_id}'. Ensure Grok tab is open."
+        "No active {} page target found for profile '{profile_id}'. Ensure {} tab is open.",
+        site.display_name(),
+        site.display_name()
       ),
     ));
   }
 
-  if grok_targets.len() > 1 {
+  if matching_targets.len() > 1 {
     return Err(WorkerError::new(
-      WorkerErrorCode::GrokTargetAmbiguous,
+      WorkerErrorCode::TargetAmbiguous,
       format!(
-        "Multiple active grok.com tabs ({}) detected for profile '{profile_id}'. Exactly 1 active Grok tab is required for deterministic execution.",
-        grok_targets.len()
+        "Multiple active {} tabs ({}) detected for profile '{profile_id}'. Exactly 1 active tab is required for deterministic execution.",
+        site.display_name(),
+        matching_targets.len()
       ),
     ));
   }
 
-  let target = grok_targets[0];
+  let target = matching_targets[0];
   let ws_url = target
     .get("webSocketDebuggerUrl")
     .and_then(|v| v.as_str())
@@ -382,7 +432,7 @@ pub async fn dispatch_to_profile_extension(
     .send(Message::Text(enable_req.to_string().into()))
     .await;
 
-  // Drain initial context creation events (up to 500ms timeout)
+  // Drain initial context creation events (up to 300ms timeout)
   let mut isolated_context_ids = Vec::new();
   let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
   while tokio::time::Instant::now() < drain_deadline {
@@ -443,7 +493,8 @@ pub async fn dispatch_to_profile_extension(
     WorkerError::new(
       WorkerErrorCode::ExtensionContextNotFound,
       format!(
-        "Extension isolated execution context not found on grok.com for profile '{profile_id}'"
+        "Extension isolated execution context not found on {} for profile '{profile_id}'",
+        site.display_name()
       ),
     )
   })?;
@@ -459,7 +510,9 @@ pub async fn dispatch_to_profile_extension(
   let exec_expr = format!(
     r#"new Promise((resolve, reject) => {{
       const req = {payload_json_str};
-      if (typeof window.__tobyflowGrokOnMessage === 'function') {{
+      if (typeof window.__flowordOnMessage === 'function') {{
+        window.__flowordOnMessage(req, null, (res) => resolve(res));
+      }} else if (typeof window.__tobyflowGrokOnMessage === 'function') {{
         window.__tobyflowGrokOnMessage(req, null, (res) => resolve(res));
       }} else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {{
         chrome.runtime.sendMessage(req, (res) => {{
@@ -684,7 +737,50 @@ pub async fn dispatch_worker_handler(
 
   // 4. Dispatch to real Extension on Profile
   match dispatch_to_profile_extension(profile_id, &payload).await {
-    Ok(result) => Ok(Json(result)),
+    Ok(result) => {
+      // 5. Strict Response Validation & Correlation Identity Verification:
+      // Response must echo all 6 fields identical to request
+      let resp_req_id = result.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_job_id = result.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_step_id = result.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_attempt_id = result.get("attemptId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_lease_id = result.get("leaseId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_profile_id = result.get("profileId").and_then(|v| v.as_str()).unwrap_or("");
+
+      if (!req_id.is_empty() && resp_req_id != req_id)
+        || (!job_id.is_empty() && resp_job_id != job_id)
+        || (!step_id.is_empty() && resp_step_id != step_id)
+        || (!attempt_id.is_empty() && resp_attempt_id != attempt_id)
+        || (!lease_id.is_empty() && resp_lease_id != lease_id)
+        || (!profile_id.is_empty() && resp_profile_id != profile_id)
+      {
+        return Err((
+          StatusCode::BAD_REQUEST,
+          Json(serde_json::json!({
+            "protocol": "floword-production",
+            "protocolVersion": 1,
+            "requestId": req_id,
+            "jobId": job_id,
+            "stepId": step_id,
+            "attemptId": attempt_id,
+            "leaseId": lease_id,
+            "profileId": profile_id,
+            "ok": false,
+            "error": {
+              "code": "CORRELATION_MISMATCH",
+              "message": format!(
+                "Extension response correlation identity mismatch. Expected req={}, job={}, step={}, attempt={}, lease={}, profile={}; got req={}, job={}, step={}, attempt={}, lease={}, profile={}",
+                req_id, job_id, step_id, attempt_id, lease_id, profile_id,
+                resp_req_id, resp_job_id, resp_step_id, resp_attempt_id, resp_lease_id, resp_profile_id
+              ),
+              "retryable": false
+            }
+          })),
+        ));
+      }
+
+      Ok(Json(result))
+    }
     Err(err) => {
       let status =
         StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);

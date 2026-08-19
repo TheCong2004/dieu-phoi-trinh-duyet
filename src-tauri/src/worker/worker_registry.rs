@@ -337,6 +337,120 @@ impl WorkerRegistry {
   }
 
   /// Atomically acquires an exclusive worker lease for a specific step attempt.
+  /// Unified worker eligibility evaluation function for both pinned and unpinned worker selection.
+  /// Rule: A pinned profile does NOT bypass capability checks, extension readiness, protocol version, or lease availability!
+  pub fn evaluate_worker_eligibility(
+    worker: &BrowserWorker,
+    req: &AcquireWorkerRequest,
+  ) -> Result<(), WorkerError> {
+    // 1. Profile constraint (if specified)
+    if let Some(ref pid) = req.profile_id {
+      if &worker.profile_id != pid {
+        return Err(WorkerError::new(
+          WorkerErrorCode::InvalidProfile,
+          format!(
+            "Worker profileId '{}' does not match requested profileId '{}'",
+            worker.profile_id, pid
+          ),
+        ));
+      }
+    }
+
+    // 2. Pool constraint (if specified)
+    if let Some(ref pool) = req.pool_id {
+      if worker.pool_id.as_deref() != Some(pool.as_str()) {
+        return Err(WorkerError::new(
+          WorkerErrorCode::PoolNotFound,
+          format!("Worker pool does not match requested pool '{pool}'"),
+        ));
+      }
+    }
+
+    // 3. Capability constraint (CRITICAL: Every acquire MUST match capability, pinned or unpinned)
+    if !worker.capabilities.contains(&req.capability) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::CapabilityUnavailable,
+        format!(
+          "Worker does not support required capability '{}'",
+          req.capability
+        ),
+      ));
+    }
+
+    // 4. Extension readiness and protocol version
+    if !worker.extension_ready {
+      return Err(WorkerError::new(
+        WorkerErrorCode::ExtensionUnavailable,
+        "Worker extension is not ready or not connected",
+      ));
+    }
+    if worker.protocol_version != Some(1) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::ProtocolMismatch,
+        format!(
+          "Worker extension protocol version is incompatible: {:?}",
+          worker.protocol_version
+        ),
+      ));
+    }
+
+    // 5. Exclusive Lease check: Must not hold an existing lease
+    if worker.current_lease_id.is_some() {
+      return Err(WorkerError::new(
+        WorkerErrorCode::WorkerBusy,
+        "Worker is already assigned to an active lease",
+      ));
+    }
+
+    // 6. Worker state must be Ready
+    if worker.state == WorkerState::Busy || worker.state == WorkerState::Leased {
+      return Err(WorkerError::new(
+        WorkerErrorCode::WorkerBusy,
+        "Worker is currently busy or leased",
+      ));
+    }
+    if worker.state == WorkerState::Reconciling {
+      return Err(WorkerError::new(
+        WorkerErrorCode::WorkerReconciling,
+        "Worker is currently reconciling state",
+      ));
+    }
+    if worker.state == WorkerState::Offline {
+      return Err(WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        "Worker is offline",
+      ));
+    }
+    if worker.state == WorkerState::Error {
+      return Err(WorkerError::new(
+        WorkerErrorCode::Internal,
+        format!("Worker is in error state: {:?}", worker.last_error),
+      ));
+    }
+    if worker.state != WorkerState::Ready {
+      return Err(WorkerError::new(
+        WorkerErrorCode::NoAvailableWorker,
+        format!("Worker is in non-ready state: {:?}", worker.state),
+      ));
+    }
+
+    // 7. Site-specific session requirements based on capability:
+    // Grok image/video generation requires grok_logged_in == true.
+    // Health checks do NOT require authenticated session (used to inspect health).
+    let is_grok_gen = req.capability.starts_with("grok.image.")
+      || req.capability.starts_with("grok.video.")
+      || req.capability == "grok.generation.status";
+    if is_grok_gen && worker.grok_logged_in != Some(true) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::GrokNotLoggedIn,
+        "Worker requires active Grok authenticated session",
+      ));
+    }
+
+    Ok(())
+  }
+
+  /// Atomically acquires an exclusive worker lease for a specific step attempt.
   pub async fn acquire(
     &self,
     req: AcquireWorkerRequest,
@@ -389,71 +503,45 @@ impl WorkerRegistry {
       }
     }
 
-    // 3. Filter eligible ready workers matching pool, capability, health, and login status
-    let eligible_worker_id = state
-      .workers
-      .values()
-      .find(|w| {
-        // State must be READY
-        if w.state != WorkerState::Ready {
-          return false;
-        }
-        // Pool filter
-        if let Some(ref pool) = req.pool_id {
-          if w.pool_id.as_deref() != Some(pool.as_str()) {
-            return false;
-          }
-        }
-        // Capability filter
-        if !w.capabilities.contains(&req.capability) {
-          return false;
-        }
-        // Extension must be confirmed ready
-        if !w.extension_ready {
-          return false;
-        }
-        // Must be logged into Grok
-        if w.grok_logged_in != Some(true) {
-          return false;
-        }
-        // Must not hold an existing lease
-        if w.current_lease_id.is_some() {
-          return false;
-        }
-        true
-      })
-      .map(|w| w.worker_id.clone());
-
-    // Strict 1:1 Profile Pinning: If profile_id is provided, match exact profile only
+    // 3. Unified Worker Selection:
     let worker_id = if let Some(ref pid) = req.profile_id {
-      state
+      // Pinned profile: Lookup specific worker and evaluate full eligibility (NEVER bypass capability!)
+      let target_worker = state
         .workers
         .values()
-        .find(|w| {
-          &w.profile_id == pid
-            && w.state == WorkerState::Ready
-            && w.extension_ready
-            && w.grok_logged_in == Some(true)
-            && w.current_lease_id.is_none()
-        })
-        .map(|w| w.worker_id.clone())
-        .ok_or_else(|| {
-          WorkerError::new(
+        .find(|w| &w.profile_id == pid || &w.worker_id == pid)
+        .cloned();
+
+      match target_worker {
+        Some(ref worker) => {
+          Self::evaluate_worker_eligibility(worker, &req)?;
+          worker.worker_id.clone()
+        }
+        None => {
+          return Err(WorkerError::new(
             WorkerErrorCode::NoAvailableWorker,
-            format!("Specified profile '{pid}' is not ready or does not exist"),
-          )
-        })?
+            format!("Specified profile '{pid}' not found in worker registry"),
+          ));
+        }
+      }
     } else {
-      match eligible_worker_id {
+      // Unpinned: Find first fully eligible worker
+      let eligible = state
+        .workers
+        .values()
+        .find(|w| Self::evaluate_worker_eligibility(w, &req).is_ok())
+        .map(|w| w.worker_id.clone());
+
+      match eligible {
         Some(id) => id,
         None => {
-          // Check if any worker exists with this pool to provide accurate error code
+          // Diagnostic pass for precise error code
           if let Some(ref pool) = req.pool_id {
-            let pool_workers = state
+            let pool_workers: Vec<_> = state
               .workers
               .values()
               .filter(|w| w.pool_id.as_deref() == Some(pool.as_str()))
-              .collect::<Vec<_>>();
+              .collect();
             if pool_workers
               .iter()
               .any(|w| w.state == WorkerState::LoginRequired || w.grok_logged_in == Some(false))
@@ -464,7 +552,7 @@ impl WorkerRegistry {
               ));
             }
           }
-          // Check if matching capability workers exist but are currently busy/leased/reconciling
+
           let matching_cap_busy = state.workers.values().any(|w| {
             w.capabilities.contains(&req.capability)
               && (w.state == WorkerState::Busy
@@ -478,9 +566,13 @@ impl WorkerRegistry {
               "Matching workers are currently busy or leased",
             ));
           }
+
           return Err(WorkerError::new(
             WorkerErrorCode::NoAvailableWorker,
-            "No ready workers available matching capability and pool requirements",
+            format!(
+              "No ready workers available matching capability '{}'",
+              req.capability
+            ),
           ));
         }
       }
@@ -1547,5 +1639,140 @@ mod tests {
       .await;
     assert!(err_rel.is_err());
     assert_eq!(err_rel.unwrap_err().code, WorkerErrorCode::LeaseNotActive);
+  }
+
+  #[tokio::test]
+  async fn test_pinned_profile_requires_exact_capability_match() {
+    let registry = WorkerRegistry::new();
+    // Worker supports grok.image.edit and grok.image.expand_9_16 only
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
+
+    // 1. Acquire with supported capability -> success
+    let ok_res = registry
+      .acquire(AcquireWorkerRequest {
+        job_id: "JOB_1".to_string(),
+        step_id: "STEP_1".to_string(),
+        attempt_id: "ATTEMPT_1".to_string(),
+        capability: "grok.image.edit".to_string(),
+        pool_id: None,
+        profile_id: Some("PROFILE_A".to_string()),
+        ttl_seconds: Some(120),
+      })
+      .await;
+    assert!(ok_res.is_ok());
+
+    registry.release(&ok_res.unwrap().lease_id).await;
+
+    // Reset worker state to Ready for next test
+    {
+      let mut st = registry.state.lock().await;
+      if let Some(w) = st.workers.get_mut("WORKER_01") {
+        w.state = WorkerState::Ready;
+      }
+    }
+
+    // 2. Acquire with unsupported capability on pinned profile -> MUST FAIL with CapabilityUnavailable
+    let err_res = registry
+      .acquire(AcquireWorkerRequest {
+        job_id: "JOB_2".to_string(),
+        step_id: "STEP_2".to_string(),
+        attempt_id: "ATTEMPT_1".to_string(),
+        capability: "social.facebook.publish".to_string(),
+        pool_id: None,
+        profile_id: Some("PROFILE_A".to_string()),
+        ttl_seconds: Some(120),
+      })
+      .await;
+    assert!(err_res.is_err());
+    assert_eq!(
+      err_res.unwrap_err().code,
+      WorkerErrorCode::CapabilityUnavailable
+    );
+  }
+
+  #[tokio::test]
+  async fn test_pinned_profile_busy_worker_returns_worker_busy() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
+
+    // First acquire succeeds
+    let acq = registry
+      .acquire(AcquireWorkerRequest {
+        job_id: "JOB_1".to_string(),
+        step_id: "STEP_1".to_string(),
+        attempt_id: "ATTEMPT_1".to_string(),
+        capability: "grok.image.edit".to_string(),
+        pool_id: None,
+        profile_id: Some("PROFILE_A".to_string()),
+        ttl_seconds: Some(120),
+      })
+      .await
+      .unwrap();
+
+    // Second acquire on same pinned profile fails with WorkerBusy
+    let err_res = registry
+      .acquire(AcquireWorkerRequest {
+        job_id: "JOB_2".to_string(),
+        step_id: "STEP_2".to_string(),
+        attempt_id: "ATTEMPT_1".to_string(),
+        capability: "grok.image.edit".to_string(),
+        pool_id: None,
+        profile_id: Some("PROFILE_A".to_string()),
+        ttl_seconds: Some(120),
+      })
+      .await;
+    assert!(err_res.is_err());
+    assert_eq!(err_res.unwrap_err().code, WorkerErrorCode::WorkerBusy);
+
+    registry.release(&acq.lease_id).await;
+  }
+
+  #[test]
+  fn test_production_site_hostname_matching_strictness() {
+    // Grok
+    assert!(ProductionSite::Grok.matches_host("grok.com"));
+    assert!(ProductionSite::Grok.matches_host("subdomain.grok.com"));
+    assert!(ProductionSite::Grok.matches_host("grok.com"));
+    assert!(!ProductionSite::Grok.matches_host("fake-grok.com"));
+    assert!(!ProductionSite::Grok.matches_host("grok.com.evil.com"));
+
+    // Facebook
+    assert!(ProductionSite::Facebook.matches_host("facebook.com"));
+    assert!(ProductionSite::Facebook.matches_host("m.facebook.com"));
+    assert!(ProductionSite::Facebook.matches_host("www.facebook.com"));
+    assert!(!ProductionSite::Facebook.matches_host("notfacebook.com"));
+    assert!(!ProductionSite::Facebook.matches_host("facebook.com.phishing.net"));
+
+    // TikTok
+    assert!(ProductionSite::TikTok.matches_host("tiktok.com"));
+    assert!(ProductionSite::TikTok.matches_host("www.tiktok.com"));
+    assert!(!ProductionSite::TikTok.matches_host("tiktoker.com"));
+
+    // YouTube Studio
+    assert!(ProductionSite::YouTubeStudio.matches_host("studio.youtube.com"));
+    assert!(ProductionSite::YouTubeStudio.matches_host("youtube.com"));
+    assert!(ProductionSite::YouTubeStudio.matches_host("www.youtube.com"));
+    assert!(!ProductionSite::YouTubeStudio.matches_host("fakeyoutube.com"));
+  }
+
+  #[test]
+  fn test_known_social_publish_descriptors_are_marked_unimplemented() {
+    let fb_desc = ProductionMethodDescriptor::lookup("social.facebook.reels.publish").unwrap();
+    assert_eq!(fb_desc.required_capability, "social.facebook.publish");
+    assert_eq!(fb_desc.site, ProductionSite::Facebook);
+    assert!(!fb_desc.implemented);
+
+    let tt_desc = ProductionMethodDescriptor::lookup("social.tiktok.video.publish").unwrap();
+    assert_eq!(tt_desc.required_capability, "social.tiktok.publish");
+    assert_eq!(tt_desc.site, ProductionSite::TikTok);
+    assert!(!tt_desc.implemented);
+
+    let yt_desc = ProductionMethodDescriptor::lookup("social.youtube.shorts.publish").unwrap();
+    assert_eq!(yt_desc.required_capability, "social.youtube.publish");
+    assert_eq!(yt_desc.site, ProductionSite::YouTubeStudio);
+    assert!(!yt_desc.implemented);
+
+    // Unknown method returns None -> PROTOCOL_MISMATCH in router
+    assert!(ProductionMethodDescriptor::lookup("unknown.method.publish").is_none());
   }
 }
