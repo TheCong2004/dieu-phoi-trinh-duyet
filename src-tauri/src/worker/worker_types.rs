@@ -43,6 +43,7 @@ impl ProductionSite {
   }
 
   /// Safe host matching using exact host or valid subdomains (never loose substring matching)
+  /// Note: YouTubeStudio strictly matches ONLY "studio.youtube.com" (Section 14).
   pub fn matches_host(&self, host: &str) -> bool {
     let lower_host = host.to_ascii_lowercase();
     match self {
@@ -51,13 +52,16 @@ impl ProductionSite {
         lower_host == "facebook.com" || lower_host.ends_with(".facebook.com")
       }
       ProductionSite::TikTok => lower_host == "tiktok.com" || lower_host.ends_with(".tiktok.com"),
-      ProductionSite::YouTubeStudio => {
-        lower_host == "studio.youtube.com"
-          || lower_host == "youtube.com"
-          || lower_host.ends_with(".youtube.com")
-      }
+      ProductionSite::YouTubeStudio => lower_host == "studio.youtube.com",
     }
   }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionSitePolicy {
+  Site(ProductionSite),
+  ActiveTask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -70,11 +74,22 @@ pub enum SiteSessionState {
   Error,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSiteSession {
+  pub site: ProductionSite,
+  pub state: SiteSessionState,
+  pub checked_at: Option<String>,
+  pub current_host: Option<String>,
+  pub account_identifier: Option<String>,
+  pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductionMethodDescriptor {
   pub method: &'static str,
   pub required_capability: &'static str,
-  pub site: ProductionSite,
+  pub site_policy: ProductionSitePolicy,
   pub requires_auth: bool,
   pub implemented: bool,
 }
@@ -86,56 +101,56 @@ impl ProductionMethodDescriptor {
       "grok.health" => Some(ProductionMethodDescriptor {
         method: "grok.health",
         required_capability: "grok.health",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: false,
         implemented: true,
       }),
       "grok.image.edit" => Some(ProductionMethodDescriptor {
         method: "grok.image.edit",
         required_capability: "grok.image.edit",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
       }),
       "grok.image.expand_9_16" => Some(ProductionMethodDescriptor {
         method: "grok.image.expand_9_16",
         required_capability: "grok.image.expand_9_16",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
       }),
       "grok.video.generate" => Some(ProductionMethodDescriptor {
         method: "grok.video.generate",
         required_capability: "grok.video.generate",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
       }),
       "grok.generation.status" => Some(ProductionMethodDescriptor {
         method: "grok.generation.status",
         required_capability: "grok.generation.status",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
-        implemented: true,
+        implemented: false,
       }),
       "grok.media.resolve" => Some(ProductionMethodDescriptor {
         method: "grok.media.resolve",
         required_capability: "grok.media.resolve",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: false,
-        implemented: true,
+        implemented: false,
       }),
       "grok.media.download" => Some(ProductionMethodDescriptor {
         method: "grok.media.download",
         required_capability: "grok.media.download",
-        site: ProductionSite::Grok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: false,
-        implemented: true,
+        implemented: false,
       }),
       "production.task.cancel" => Some(ProductionMethodDescriptor {
         method: "production.task.cancel",
         required_capability: "production.task.cancel",
-        site: ProductionSite::Grok, // cancellation can target current active task
+        site_policy: ProductionSitePolicy::ActiveTask,
         requires_auth: false,
         implemented: true,
       }),
@@ -144,21 +159,21 @@ impl ProductionMethodDescriptor {
       "social.facebook.health" => Some(ProductionMethodDescriptor {
         method: "social.facebook.health",
         required_capability: "social.facebook.health",
-        site: ProductionSite::Facebook,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Facebook),
         requires_auth: false,
         implemented: true,
       }),
       "social.tiktok.health" => Some(ProductionMethodDescriptor {
         method: "social.tiktok.health",
         required_capability: "social.tiktok.health",
-        site: ProductionSite::TikTok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::TikTok),
         requires_auth: false,
         implemented: true,
       }),
       "social.youtube.health" => Some(ProductionMethodDescriptor {
         method: "social.youtube.health",
         required_capability: "social.youtube.health",
-        site: ProductionSite::YouTubeStudio,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::YouTubeStudio),
         requires_auth: false,
         implemented: true,
       }),
@@ -167,25 +182,91 @@ impl ProductionMethodDescriptor {
       "social.facebook.reels.publish" => Some(ProductionMethodDescriptor {
         method: "social.facebook.reels.publish",
         required_capability: "social.facebook.publish",
-        site: ProductionSite::Facebook,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::Facebook),
         requires_auth: true,
         implemented: false,
       }),
       "social.tiktok.video.publish" => Some(ProductionMethodDescriptor {
         method: "social.tiktok.video.publish",
         required_capability: "social.tiktok.publish",
-        site: ProductionSite::TikTok,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::TikTok),
         requires_auth: true,
         implemented: false,
       }),
       "social.youtube.shorts.publish" => Some(ProductionMethodDescriptor {
         method: "social.youtube.shorts.publish",
         required_capability: "social.youtube.publish",
-        site: ProductionSite::YouTubeStudio,
+        site_policy: ProductionSitePolicy::Site(ProductionSite::YouTubeStudio),
         requires_auth: true,
         implemented: false,
       }),
 
+      _ => None,
+    }
+  }
+}
+
+/// Centralized capability policy mapping capability strings to site and authentication requirements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityPolicy {
+  pub capability: &'static str,
+  pub site: ProductionSite,
+  pub requires_auth: bool,
+}
+
+impl CapabilityPolicy {
+  pub fn lookup(capability: &str) -> Option<CapabilityPolicy> {
+    match capability {
+      "grok.health" => Some(CapabilityPolicy {
+        capability: "grok.health",
+        site: ProductionSite::Grok,
+        requires_auth: false,
+      }),
+      "grok.image.edit" => Some(CapabilityPolicy {
+        capability: "grok.image.edit",
+        site: ProductionSite::Grok,
+        requires_auth: true,
+      }),
+      "grok.image.expand_9_16" => Some(CapabilityPolicy {
+        capability: "grok.image.expand_9_16",
+        site: ProductionSite::Grok,
+        requires_auth: true,
+      }),
+      "grok.video.generate" => Some(CapabilityPolicy {
+        capability: "grok.video.generate",
+        site: ProductionSite::Grok,
+        requires_auth: true,
+      }),
+      "social.facebook.health" => Some(CapabilityPolicy {
+        capability: "social.facebook.health",
+        site: ProductionSite::Facebook,
+        requires_auth: false,
+      }),
+      "social.tiktok.health" => Some(CapabilityPolicy {
+        capability: "social.tiktok.health",
+        site: ProductionSite::TikTok,
+        requires_auth: false,
+      }),
+      "social.youtube.health" => Some(CapabilityPolicy {
+        capability: "social.youtube.health",
+        site: ProductionSite::YouTubeStudio,
+        requires_auth: false,
+      }),
+      "social.facebook.publish" => Some(CapabilityPolicy {
+        capability: "social.facebook.publish",
+        site: ProductionSite::Facebook,
+        requires_auth: true,
+      }),
+      "social.tiktok.publish" => Some(CapabilityPolicy {
+        capability: "social.tiktok.publish",
+        site: ProductionSite::TikTok,
+        requires_auth: true,
+      }),
+      "social.youtube.publish" => Some(CapabilityPolicy {
+        capability: "social.youtube.publish",
+        site: ProductionSite::YouTubeStudio,
+        requires_auth: true,
+      }),
       _ => None,
     }
   }
@@ -209,6 +290,9 @@ pub enum WorkerErrorCode {
   ExtensionContextNotFound,
   ExtensionUnavailable,
   CapabilityUnavailable,
+  CapabilityMismatch,
+  MethodNotSupported,
+  InvalidRequest,
   TargetNotFound,
   TargetAmbiguous,
   SiteMismatch,
@@ -253,16 +337,19 @@ impl WorkerError {
       WorkerErrorCode::PoolNotFound | WorkerErrorCode::LeaseNotFound => 404,
       WorkerErrorCode::WorkerBusy
       | WorkerErrorCode::NoAvailableWorker
-      | WorkerErrorCode::CapabilityUnavailable
+      | WorkerErrorCode::CapabilityMismatch
       | WorkerErrorCode::WorkerReconciling
       | WorkerErrorCode::TargetAmbiguous
       | WorkerErrorCode::GrokTargetAmbiguous
       | WorkerErrorCode::GrokNotLoggedIn
       | WorkerErrorCode::SiteSessionNotReady
       | WorkerErrorCode::LeaseNotActive => 409,
+      WorkerErrorCode::CapabilityUnavailable => 501,
       WorkerErrorCode::InvalidLease
       | WorkerErrorCode::CorrelationMismatch
       | WorkerErrorCode::ProtocolMismatch
+      | WorkerErrorCode::MethodNotSupported
+      | WorkerErrorCode::InvalidRequest
       | WorkerErrorCode::InvalidProfile
       | WorkerErrorCode::SiteMismatch => 400,
       WorkerErrorCode::InvalidHealthResponse => 502,
@@ -287,6 +374,8 @@ impl WorkerError {
       WorkerErrorCode::LeaseNotActive => "LEASE_NOT_ACTIVE",
       WorkerErrorCode::CorrelationMismatch => "CORRELATION_MISMATCH",
       WorkerErrorCode::ProtocolMismatch => "PROTOCOL_MISMATCH",
+      WorkerErrorCode::MethodNotSupported => "METHOD_NOT_SUPPORTED",
+      WorkerErrorCode::InvalidRequest => "INVALID_REQUEST",
       WorkerErrorCode::InvalidProfile => "INVALID_PROFILE",
       WorkerErrorCode::WorkerReconciling => "WORKER_RECONCILING",
       WorkerErrorCode::WorkerRegistryInitializing => "WORKER_REGISTRY_INITIALIZING",
@@ -295,6 +384,7 @@ impl WorkerError {
       WorkerErrorCode::ExtensionContextNotFound => "EXTENSION_CONTEXT_NOT_FOUND",
       WorkerErrorCode::ExtensionUnavailable => "EXTENSION_UNAVAILABLE",
       WorkerErrorCode::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
+      WorkerErrorCode::CapabilityMismatch => "CAPABILITY_MISMATCH",
       WorkerErrorCode::TargetNotFound => "TARGET_NOT_FOUND",
       WorkerErrorCode::TargetAmbiguous => "TARGET_AMBIGUOUS",
       WorkerErrorCode::SiteMismatch => "SITE_MISMATCH",
@@ -326,7 +416,11 @@ pub struct BrowserWorker {
   pub extension_ready: bool,
   pub extension_version: Option<String>,
   pub protocol_version: Option<u32>,
-  pub grok_logged_in: Option<bool>,
+  pub grok_logged_in: Option<bool>, // Legacy Grok-specific compatibility projection
+  #[serde(default)]
+  pub site_sessions: std::collections::HashMap<ProductionSite, WorkerSiteSession>,
+  #[serde(default)]
+  pub site_capabilities: std::collections::HashMap<ProductionSite, Vec<String>>,
   pub current_lease_id: Option<String>,
   pub current_job_id: Option<String>,
   pub last_heartbeat_at: Option<String>,
@@ -400,8 +494,13 @@ pub struct WorkerHealthHandshakeRequest {
   pub protocol_version: u32,
   pub extension_version: String,
   pub worker_state: String,
-  pub logged_in: bool,
+  pub logged_in: Option<bool>,
+  #[serde(default)]
   pub capabilities: Vec<String>,
+  #[serde(default)]
+  pub site_sessions: Vec<WorkerSiteSession>,
+  #[serde(default)]
+  pub site_capabilities: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -419,11 +518,15 @@ pub struct ListLeasesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyPublicationRequest {
-  pub platform: Option<String>,
+  pub publication_id: String,
+  pub platform: String,
+  pub profile_id: String,
+  pub idempotency_key: String,
+  pub target_page_id: Option<String>,
+  pub target_handle: Option<String>,
+  pub target_channel_id: Option<String>,
   pub external_post_id: Option<String>,
   pub target_url: Option<String>,
-  pub profile_id: Option<String>,
-  pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -431,7 +534,18 @@ pub struct VerifyPublicationRequest {
 pub struct VerifyPublicationResponse {
   pub verified: bool,
   pub status: String,
-  pub reason: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub error: Option<VerifyPublicationError>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub reason: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyPublicationError {
+  pub code: String,
+  pub message: String,
+  pub retryable: bool,
 }

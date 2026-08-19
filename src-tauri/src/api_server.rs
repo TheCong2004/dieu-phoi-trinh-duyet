@@ -315,6 +315,7 @@ struct DownloadBrowserResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[allow(dead_code)] // Schema-only type used in OpenAPI spec; not constructed in Rust
 pub struct ToastPayload {
   pub message: String,
   pub variant: String,

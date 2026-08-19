@@ -176,12 +176,19 @@ pub async fn list_leases_handler() -> Json<ListLeasesResponse> {
 pub async fn verify_publication_handler(
   Json(_payload): Json<VerifyPublicationRequest>,
 ) -> Json<VerifyPublicationResponse> {
-  // Section 18 / Section 56: In this foundation phase, publication verification is not yet implemented.
-  // Must return verified: false with status: "CAPABILITY_UNAVAILABLE" (never verified: true without evidence).
+  // Section 25.2 / Section 56: Foundation phase returns verified: false with CAPABILITY_UNAVAILABLE
+  // Never returns verified: true without authoritative platform evidence.
   Json(VerifyPublicationResponse {
     verified: false,
     status: "CAPABILITY_UNAVAILABLE".to_string(),
-    reason: "Social post verification is not implemented in current runtime phase".to_string(),
+    error: Some(VerifyPublicationError {
+      code: "CAPABILITY_UNAVAILABLE".to_string(),
+      message: "Social post verification is not implemented in current runtime phase".to_string(),
+      retryable: false,
+    }),
+    reason: Some(
+      "Social post verification is not implemented in current runtime phase".to_string(),
+    ),
     details: None,
   })
 }
@@ -287,29 +294,29 @@ pub async fn dispatch_to_profile_extension(
   profile_id: &str,
   payload: &serde_json::Value,
 ) -> Result<serde_json::Value, WorkerError> {
-  let method = payload
-    .get("method")
-    .and_then(|v| v.as_str())
-    .unwrap_or("");
+  let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-  let descriptor = ProductionMethodDescriptor::lookup(method);
+  let descriptor = ProductionMethodDescriptor::lookup(method).ok_or_else(|| {
+    WorkerError::new(
+      WorkerErrorCode::MethodNotSupported,
+      format!("Method '{method}' is not supported in this runtime"),
+    )
+  })?;
 
-  // If method is a known social publish command that is not yet implemented, fail closed with CAPABILITY_UNAVAILABLE
-  if let Some(ref desc) = descriptor {
-    if !desc.implemented {
-      return Err(WorkerError::new(
-        WorkerErrorCode::CapabilityUnavailable,
-        format!(
-          "Method '{method}' is recognized but executor is not implemented in current runtime phase"
-        ),
-      ));
-    }
+  // If method is not implemented, fail closed with CAPABILITY_UNAVAILABLE
+  if !descriptor.implemented {
+    return Err(WorkerError::new(
+      WorkerErrorCode::CapabilityUnavailable,
+      format!(
+        "Method '{method}' is recognized but executor is not implemented in current runtime phase"
+      ),
+    ));
   }
 
-  let site = descriptor
-    .as_ref()
-    .map(|d| d.site)
-    .unwrap_or(ProductionSite::Grok);
+  let site = match descriptor.site_policy {
+    ProductionSitePolicy::Site(s) => s,
+    ProductionSitePolicy::ActiveTask => ProductionSite::Grok,
+  };
 
   let profiles_dir = crate::profile::ProfileManager::instance().get_profiles_dir();
   let profiles = crate::profile::ProfileManager::instance()
@@ -546,119 +553,249 @@ pub async fn dispatch_to_profile_extension(
   Ok(prod_result)
 }
 
-/// Active health probe from Donut Browser to Extension instance with zero fake fallbacks.
+/// Active health probe from Donut Browser to Extension instance across all sites.
+/// Collects per-site session state and aggregates capabilities without last-probe-wins loss.
 pub async fn probe_worker_health(
   profile_id: &str,
 ) -> Result<WorkerHealthHandshakeRequest, WorkerError> {
-  let health_req = serde_json::json!({
-    "protocol": "floword-production",
-    "protocolVersion": 1,
-    "requestId": format!("HEALTH_PROBE_{}", Uuid::new_v4().simple()),
-    "jobId": "SYS",
-    "stepId": "HEALTH_PROBE",
-    "attemptId": "1",
-    "leaseId": "SYS",
-    "profileId": profile_id,
-    "method": "grok.health",
-    "params": {
-      "timeoutMs": 10000
-    },
-    "createdAt": chrono::Utc::now().to_rfc3339()
-  });
+  let profiles_dir = crate::profile::ProfileManager::instance().get_profiles_dir();
+  let profiles = crate::profile::ProfileManager::instance()
+    .list_profiles()
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Failed to list profiles: {e}"),
+      )
+    })?;
 
-  let res = dispatch_to_profile_extension(profile_id, &health_req).await?;
+  let profile = profiles
+    .into_iter()
+    .find(|p| p.id.to_string() == profile_id)
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidProfile,
+        format!("Profile ID '{profile_id}' not found in runtime"),
+      )
+    })?;
 
-  let proto = res.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
-  let proto_ver = res
-    .get("protocolVersion")
-    .and_then(|v| v.as_u64())
-    .unwrap_or(0);
-  if proto != "floword-production" || proto_ver != 1 {
-    return Err(WorkerError::new(
-      WorkerErrorCode::ProtocolMismatch,
-      format!("Health probe protocol mismatch: expected floword-production v1, got '{proto}' v{proto_ver}"),
-    ));
-  }
+  let profile_path = profile.get_profile_data_path(&profiles_dir);
+  let profile_path_str = profile_path.to_string_lossy();
 
-  let health_val = res.get("result").ok_or_else(|| {
+  let cdp_port = crate::wayfern_manager::WayfernManager::instance()
+    .get_cdp_port(&profile_path_str)
+    .await
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("No active browser/CDP instance running for profile '{profile_id}'"),
+      )
+    })?;
+
+  let url = format!("http://127.0.0.1:{cdp_port}/json");
+  let http_client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(5))
+    .build()
+    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
+
+  let targets_resp = http_client.get(&url).send().await.map_err(|e| {
     WorkerError::new(
-      WorkerErrorCode::InvalidHealthResponse,
-      "Health response missing 'result' object",
+      WorkerErrorCode::BridgeDisconnected,
+      format!("CDP endpoint unavailable: {e}"),
     )
   })?;
 
-  let resp_profile = health_val
-    .get("profileId")
-    .and_then(|v| v.as_str())
-    .unwrap_or("");
-  if resp_profile != profile_id {
-    return Err(WorkerError::new(
-      WorkerErrorCode::InvalidProfile,
-      format!("Health probe profile mismatch: expected {profile_id}, got {resp_profile}"),
-    ));
+  let targets: Vec<serde_json::Value> = targets_resp.json().await.map_err(|e| {
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Failed to parse CDP targets: {e}"),
+    )
+  })?;
+
+  let mut site_sessions = Vec::new();
+  let mut site_capabilities: std::collections::HashMap<String, Vec<String>> =
+    std::collections::HashMap::new();
+  let mut grok_logged_in: Option<bool> = None;
+  let mut overall_worker_state = "IDLE".to_string();
+  let mut extension_version = "1.1.49".to_string();
+
+  let sites_to_probe = [
+    (ProductionSite::Grok, "grok.health", "grok"),
+    (
+      ProductionSite::Facebook,
+      "social.facebook.health",
+      "facebook",
+    ),
+    (ProductionSite::TikTok, "social.tiktok.health", "tiktok"),
+    (
+      ProductionSite::YouTubeStudio,
+      "social.youtube.health",
+      "youtube-studio",
+    ),
+  ];
+
+  for (site, health_method, site_key) in sites_to_probe {
+    let matching: Vec<&serde_json::Value> = targets
+      .iter()
+      .filter(|t| {
+        let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if t_type != "page" {
+          return false;
+        }
+        let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if let Ok(parsed) = url::Url::parse(t_url) {
+          if let Some(host) = parsed.host_str() {
+            return site.matches_host(host);
+          }
+        }
+        false
+      })
+      .collect();
+
+    if matching.len() == 1 {
+      let health_req = serde_json::json!({
+        "protocol": "floword-production",
+        "protocolVersion": 1,
+        "requestId": format!("HEALTH_PROBE_{}_{}", site_key, Uuid::new_v4().simple()),
+        "jobId": "SYS",
+        "stepId": "HEALTH_PROBE",
+        "attemptId": "1",
+        "leaseId": "SYS",
+        "profileId": profile_id,
+        "method": health_method,
+        "params": {
+          "timeoutMs": 10000
+        },
+        "createdAt": chrono::Utc::now().to_rfc3339()
+      });
+
+      if let Ok(res) = dispatch_to_profile_extension(profile_id, &health_req).await {
+        if let Some(health_val) = res.get("result") {
+          if site == ProductionSite::Grok {
+            if let Some(logged_in) = health_val.get("loggedIn").and_then(|v| v.as_bool()) {
+              grok_logged_in = Some(logged_in);
+              site_sessions.push(WorkerSiteSession {
+                site: ProductionSite::Grok,
+                state: if logged_in {
+                  SiteSessionState::Ready
+                } else {
+                  SiteSessionState::AuthRequired
+                },
+                checked_at: Some(chrono::Utc::now().to_rfc3339()),
+                current_host: Some("grok.com".to_string()),
+                account_identifier: None,
+                message: None,
+              });
+            }
+            if let Some(w_state) = health_val.get("workerState").and_then(|v| v.as_str()) {
+              overall_worker_state = w_state.to_string();
+            }
+            if let Some(ext_v) = health_val.get("extensionVersion").and_then(|v| v.as_str()) {
+              extension_version = ext_v.to_string();
+            }
+            if let Some(caps_arr) = health_val.get("capabilities").and_then(|v| v.as_array()) {
+              let caps: Vec<String> = caps_arr
+                .iter()
+                .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                .collect();
+              if !caps.is_empty() {
+                site_capabilities.insert("grok".to_string(), caps);
+              }
+            }
+          } else {
+            let session_state = match health_val
+              .get("sessionState")
+              .and_then(|v| v.as_str())
+              .unwrap_or("")
+            {
+              "READY" => SiteSessionState::Ready,
+              "AUTH_REQUIRED" => SiteSessionState::AuthRequired,
+              "ERROR" => SiteSessionState::Error,
+              _ => SiteSessionState::Unknown,
+            };
+            let current_host = health_val
+              .get("currentHost")
+              .and_then(|v| v.as_str())
+              .map(|s| s.to_string());
+            let acc_id = health_val
+              .get("accountIdentifier")
+              .and_then(|v| v.as_str())
+              .map(|s| s.to_string());
+            let msg = health_val
+              .get("message")
+              .and_then(|v| v.as_str())
+              .map(|s| s.to_string());
+            let checked_at = health_val
+              .get("checkedAt")
+              .and_then(|v| v.as_str())
+              .map(|s| s.to_string());
+
+            site_sessions.push(WorkerSiteSession {
+              site,
+              state: session_state,
+              checked_at,
+              current_host,
+              account_identifier: acc_id,
+              message: msg,
+            });
+
+            if let Some(caps_arr) = health_val.get("capabilities").and_then(|v| v.as_array()) {
+              let caps: Vec<String> = caps_arr
+                .iter()
+                .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                .collect();
+              if !caps.is_empty() {
+                site_capabilities.insert(site_key.to_string(), caps);
+              }
+            }
+          }
+        }
+      }
+    } else if matching.len() > 1 {
+      site_sessions.push(WorkerSiteSession {
+        site,
+        state: SiteSessionState::Error,
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        current_host: None,
+        account_identifier: None,
+        message: Some(format!(
+          "Multiple active tabs ({}) detected (TARGET_AMBIGUOUS)",
+          matching.len()
+        )),
+      });
+    } else {
+      site_sessions.push(WorkerSiteSession {
+        site,
+        state: SiteSessionState::Unknown,
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        current_host: None,
+        account_identifier: None,
+        message: Some(format!("No active tab open for {}", site.display_name())),
+      });
+    }
   }
 
-  let logged_in = health_val
-    .get("loggedIn")
-    .and_then(|v| v.as_bool())
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::InvalidHealthResponse,
-        "Health response missing required boolean 'loggedIn'",
-      )
-    })?;
-
-  let worker_state = health_val
-    .get("workerState")
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::InvalidHealthResponse,
-        "Health response missing required string 'workerState'",
-      )
-    })?
-    .to_string();
-
-  let ext_ver = health_val
-    .get("extensionVersion")
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::InvalidHealthResponse,
-        "Health response missing required string 'extensionVersion'",
-      )
-    })?
-    .to_string();
-
-  let caps_arr = health_val
-    .get("capabilities")
-    .and_then(|v| v.as_array())
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::InvalidHealthResponse,
-        "Health response missing required array 'capabilities'",
-      )
-    })?;
-
-  if caps_arr.is_empty() {
-    return Err(WorkerError::new(
-      WorkerErrorCode::InvalidHealthResponse,
-      "Health response capabilities array cannot be empty",
-    ));
-  }
-
-  let capabilities: Vec<String> = caps_arr
-    .iter()
-    .filter_map(|c| c.as_str().map(|s| s.to_string()))
+  let mut aggregate_caps: Vec<String> = site_capabilities
+    .values()
+    .flatten()
+    .filter(|cap| {
+      cap.as_str() != "social.facebook.publish"
+        && cap.as_str() != "social.tiktok.publish"
+        && cap.as_str() != "social.youtube.publish"
+    })
+    .cloned()
     .collect();
+  aggregate_caps.sort();
+  aggregate_caps.dedup();
 
   Ok(WorkerHealthHandshakeRequest {
     profile_id: profile_id.to_string(),
     protocol_version: 1,
-    extension_version: ext_ver,
-    worker_state,
-    logged_in,
-    capabilities,
+    extension_version,
+    worker_state: overall_worker_state,
+    logged_in: grok_logged_in,
+    capabilities: aggregate_caps,
+    site_sessions,
+    site_capabilities,
   })
 }
 
@@ -666,93 +803,251 @@ pub async fn dispatch_worker_handler(
   Path(worker_id): Path<String>,
   Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-  let profile_id = payload
-    .get("profileId")
-    .and_then(|v| v.as_str())
-    .unwrap_or_default();
-  let req_id = payload
-    .get("requestId")
+  // 1. Protocol version validation
+  let proto = payload
+    .get("protocol")
     .and_then(|v| v.as_str())
     .unwrap_or("");
-  let job_id = payload.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
-  let step_id = payload.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
-  let attempt_id = payload
-    .get("attemptId")
-    .and_then(|v| v.as_str())
-    .unwrap_or("");
-  let lease_id = payload
-    .get("leaseId")
-    .and_then(|v| v.as_str())
-    .unwrap_or("");
-
-  // 1. Exact profile identity check
-  if worker_id != profile_id && worker_id != format!("browser-profile:{profile_id}") {
+  let proto_ver = payload
+    .get("protocolVersion")
+    .and_then(|v| v.as_u64())
+    .unwrap_or(0);
+  if proto != "floword-production" || proto_ver != 1 {
     return Err((
       StatusCode::BAD_REQUEST,
       Json(serde_json::json!({
         "error": {
-          "code": "INVALID_PROFILE",
-          "message": format!("Target worker '{worker_id}' does not match request profileId '{profile_id}'")
+          "code": "PROTOCOL_MISMATCH",
+          "message": format!("Protocol version mismatch: expected floword-production v1, got '{proto}' v{proto_ver}")
         }
       })),
     ));
   }
 
-  // 2. Strict Active Lease Validation (Two-way Lease <-> Worker cross check)
-  if let Err(err) = WORKER_REGISTRY
+  // 2. Strict required envelope identity fields validation (No empty strings)
+  let req_id = payload
+    .get("requestId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let job_id = payload
+    .get("jobId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let step_id = payload
+    .get("stepId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let attempt_id = payload
+    .get("attemptId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let lease_id = payload
+    .get("leaseId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let profile_id = payload
+    .get("profileId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+  let method = payload
+    .get("method")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim();
+
+  if req_id.is_empty()
+    || job_id.is_empty()
+    || step_id.is_empty()
+    || attempt_id.is_empty()
+    || lease_id.is_empty()
+    || profile_id.is_empty()
+    || method.is_empty()
+  {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(serde_json::json!({
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "Missing or empty required correlation identity fields (requestId, jobId, stepId, attemptId, leaseId, profileId, method)"
+        }
+      })),
+    ));
+  }
+
+  // 3. Method Descriptor lookup (Reject unknown methods before CDP!)
+  let descriptor = match ProductionMethodDescriptor::lookup(method) {
+    Some(desc) => desc,
+    None => {
+      return Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+          "error": {
+            "code": "METHOD_NOT_SUPPORTED",
+            "message": format!("Method '{method}' is not supported in this runtime")
+          }
+        })),
+      ));
+    }
+  };
+
+  // 4. Method implementation policy check
+  if !descriptor.implemented {
+    return Err((
+      StatusCode::NOT_IMPLEMENTED,
+      Json(serde_json::json!({
+        "error": {
+          "code": "CAPABILITY_UNAVAILABLE",
+          "message": format!("Method '{method}' is recognized but executor is not implemented in current runtime phase"),
+          "retryable": false
+        }
+      })),
+    ));
+  }
+
+  // 5. Strict Active Lease Validation
+  let lease = match WORKER_REGISTRY
     .validate_active_lease(lease_id, job_id, step_id, attempt_id, profile_id)
     .await
   {
-    let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::CONFLICT);
-    return Err((
-      status,
-      Json(serde_json::json!({
-        "error": {
-          "code": err.code_str(),
-          "message": err.message
-        }
-      })),
-    ));
-  }
-
-  // 3. Worker State Check
-  let is_available = {
-    let workers = WORKER_REGISTRY.list_workers().await;
-    workers.workers.iter().any(|w| {
-      (w.worker_id == worker_id || w.profile_id == profile_id) && w.state != WorkerState::Offline
-    })
+    Ok(l) => l,
+    Err(err) => {
+      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::CONFLICT);
+      return Err((
+        status,
+        Json(serde_json::json!({
+          "error": {
+            "code": err.code_str(),
+            "message": err.message
+          }
+        })),
+      ));
+    }
   };
 
-  if !is_available {
+  // 6. Exact worker_id check: URL path worker_id MUST equal lease.worker_id exactly! (Section 11)
+  if worker_id != lease.worker_id {
     return Err((
-      StatusCode::SERVICE_UNAVAILABLE,
+      StatusCode::BAD_REQUEST,
       Json(serde_json::json!({
         "error": {
-          "code": "BRIDGE_DISCONNECTED",
-          "message": format!("Worker '{worker_id}' is disconnected or offline")
+          "code": "INVALID_LEASE",
+          "message": format!(
+            "Dispatch worker_id '{worker_id}' does not match lease worker_id '{}'",
+            lease.worker_id
+          )
         }
       })),
     ));
   }
 
-  // 4. Dispatch to real Extension on Profile
+  // 7. Capability Escalation Protection (Section 10): lease.capability MUST equal descriptor.required_capability
+  if lease.capability != descriptor.required_capability {
+    return Err((
+      StatusCode::CONFLICT,
+      Json(serde_json::json!({
+        "error": {
+          "code": "CAPABILITY_MISMATCH",
+          "message": format!(
+            "Lease capability '{}' does not match method required capability '{}'",
+            lease.capability, descriptor.required_capability
+          ),
+          "retryable": false
+        }
+      })),
+    ));
+  }
+
+  // 8. Worker State and Capability Check
+  let worker_opt = {
+    let workers = WORKER_REGISTRY.list_workers().await;
+    workers
+      .workers
+      .into_iter()
+      .find(|w| w.worker_id == worker_id || w.profile_id == profile_id)
+  };
+
+  let worker = match worker_opt {
+    Some(w) if w.state != WorkerState::Offline => w,
+    _ => {
+      return Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+          "error": {
+            "code": "BRIDGE_DISCONNECTED",
+            "message": format!("Worker '{worker_id}' is disconnected or offline")
+          }
+        })),
+      ));
+    }
+  };
+
+  if !worker.capabilities.contains(&lease.capability) {
+    return Err((
+      StatusCode::CONFLICT,
+      Json(serde_json::json!({
+        "error": {
+          "code": "CAPABILITY_UNAVAILABLE",
+          "message": format!("Worker no longer supports lease capability '{}'", lease.capability),
+          "retryable": false
+        }
+      })),
+    ));
+  }
+
+  // 9. Dispatch to real Extension on Profile
   match dispatch_to_profile_extension(profile_id, &payload).await {
     Ok(result) => {
-      // 5. Strict Response Validation & Correlation Identity Verification:
-      // Response must echo all 6 fields identical to request
-      let resp_req_id = result.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+      // 10. Strict Response Validation: Protocol, version, and 6-field correlation echo
+      let resp_proto = result
+        .get("protocol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+      let resp_proto_ver = result
+        .get("protocolVersion")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+      if resp_proto != "floword-production" || resp_proto_ver != 1 {
+        return Err((
+          StatusCode::BAD_REQUEST,
+          Json(serde_json::json!({
+            "error": {
+              "code": "PROTOCOL_MISMATCH",
+              "message": format!(
+                "Extension response protocol mismatch: expected floword-production v1, got '{resp_proto}' v{resp_proto_ver}"
+              )
+            }
+          })),
+        ));
+      }
+
+      let resp_req_id = result
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
       let resp_job_id = result.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
       let resp_step_id = result.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
-      let resp_attempt_id = result.get("attemptId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_attempt_id = result
+        .get("attemptId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
       let resp_lease_id = result.get("leaseId").and_then(|v| v.as_str()).unwrap_or("");
-      let resp_profile_id = result.get("profileId").and_then(|v| v.as_str()).unwrap_or("");
+      let resp_profile_id = result
+        .get("profileId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-      if (!req_id.is_empty() && resp_req_id != req_id)
-        || (!job_id.is_empty() && resp_job_id != job_id)
-        || (!step_id.is_empty() && resp_step_id != step_id)
-        || (!attempt_id.is_empty() && resp_attempt_id != attempt_id)
-        || (!lease_id.is_empty() && resp_lease_id != lease_id)
-        || (!profile_id.is_empty() && resp_profile_id != profile_id)
+      if resp_req_id != req_id
+        || resp_job_id != job_id
+        || resp_step_id != step_id
+        || resp_attempt_id != attempt_id
+        || resp_lease_id != lease_id
+        || resp_profile_id != profile_id
       {
         return Err((
           StatusCode::BAD_REQUEST,

@@ -1453,6 +1453,8 @@ pub async fn launch_browser_profile_impl(
       extension_version: None,
       protocol_version: None,
       grok_logged_in: None,
+      site_sessions: std::collections::HashMap::new(),
+      site_capabilities: std::collections::HashMap::new(),
       current_lease_id: None,
       current_job_id: None,
       last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),

@@ -185,6 +185,8 @@ impl WorkerRegistry {
           extension_version: None,
           protocol_version: None,
           grok_logged_in: None,
+          site_sessions: std::collections::HashMap::new(),
+          site_capabilities: std::collections::HashMap::new(),
           current_lease_id: None,
           current_job_id: None,
           last_heartbeat_at: None,
@@ -200,7 +202,7 @@ impl WorkerRegistry {
   }
 
   /// Real worker handshake from browser runtime / extension health probe.
-  /// Seamlessly performs health update and automatic reconciliation.
+  /// Multi-site aware: updates per-site session state and aggregates capabilities without last-probe-wins loss.
   pub async fn handle_health_handshake(
     &self,
     worker_id: &str,
@@ -251,14 +253,72 @@ impl WorkerRegistry {
     worker.extension_ready = true;
     worker.extension_version = Some(req.extension_version);
     worker.protocol_version = Some(req.protocol_version);
-    worker.grok_logged_in = Some(req.logged_in);
-    worker.capabilities = req.capabilities;
     worker.last_heartbeat_at = Some(Utc::now().to_rfc3339());
 
-    if !req.logged_in {
-      worker.state = WorkerState::LoginRequired;
-    } else if worker.current_lease_id.is_some() {
-      // Active lease authority wins: Worker remains Leased/Busy regardless of whether extension reports IDLE or BUSY
+    if let Some(logged_in) = req.logged_in {
+      worker.grok_logged_in = Some(logged_in);
+      worker.site_sessions.insert(
+        ProductionSite::Grok,
+        WorkerSiteSession {
+          site: ProductionSite::Grok,
+          state: if logged_in {
+            SiteSessionState::Ready
+          } else {
+            SiteSessionState::AuthRequired
+          },
+          checked_at: Some(Utc::now().to_rfc3339()),
+          current_host: Some("grok.com".to_string()),
+          account_identifier: None,
+          message: None,
+        },
+      );
+    }
+
+    // Merge reported site sessions
+    for site_session in req.site_sessions {
+      worker.site_sessions.insert(site_session.site, site_session);
+    }
+
+    // Merge reported site capabilities (prevent last-probe-wins capability erasure)
+    if !req.site_capabilities.is_empty() {
+      for (site_str, caps) in req.site_capabilities {
+        let site = match site_str.as_str() {
+          "grok" => Some(ProductionSite::Grok),
+          "facebook" => Some(ProductionSite::Facebook),
+          "tiktok" => Some(ProductionSite::TikTok),
+          "youtube-studio" | "youtube" => Some(ProductionSite::YouTubeStudio),
+          _ => None,
+        };
+        if let Some(s) = site {
+          worker.site_capabilities.insert(s, caps);
+        }
+      }
+    } else if !req.capabilities.is_empty() {
+      // Default legacy unpartitioned capabilities to Grok site
+      worker
+        .site_capabilities
+        .insert(ProductionSite::Grok, req.capabilities);
+    }
+
+    // Derive worker.capabilities as the deduplicated union of all site capabilities.
+    // Invariant: publish capabilities (social.*.publish) MUST NOT be advertised until real executors exist.
+    let mut all_caps: Vec<String> = worker
+      .site_capabilities
+      .values()
+      .flatten()
+      .filter(|cap| {
+        cap.as_str() != "social.facebook.publish"
+          && cap.as_str() != "social.tiktok.publish"
+          && cap.as_str() != "social.youtube.publish"
+      })
+      .cloned()
+      .collect();
+    all_caps.sort();
+    all_caps.dedup();
+    worker.capabilities = all_caps;
+
+    // Global WorkerState represents overall browser worker runtime readiness (not a single social login)
+    if worker.current_lease_id.is_some() {
       worker.state = if req.worker_state == "BUSY" {
         WorkerState::Busy
       } else {
@@ -267,7 +327,6 @@ impl WorkerRegistry {
     } else if req.worker_state == "BUSY" || req.worker_state == "LEASED" {
       worker.state = WorkerState::Busy;
     } else if req.worker_state == "IDLE" {
-      // Safe Automatic Reconciliation: Transition to Ready ONLY when extension is strictly IDLE and has NO active lease
       worker.state = WorkerState::Ready;
     } else if req.worker_state == "STARTING" || req.worker_state == "RECONCILING" {
       worker.state = WorkerState::Reconciling;
@@ -310,6 +369,21 @@ impl WorkerRegistry {
 
     if let Some(logged_in) = grok_logged_in {
       worker.grok_logged_in = Some(logged_in);
+      worker.site_sessions.insert(
+        ProductionSite::Grok,
+        WorkerSiteSession {
+          site: ProductionSite::Grok,
+          state: if logged_in {
+            SiteSessionState::Ready
+          } else {
+            SiteSessionState::AuthRequired
+          },
+          checked_at: Some(Utc::now().to_rfc3339()),
+          current_host: Some("grok.com".to_string()),
+          account_identifier: None,
+          message: None,
+        },
+      );
     }
 
     if !is_healthy {
@@ -325,8 +399,6 @@ impl WorkerRegistry {
       } else {
         WorkerState::Busy
       };
-    } else if worker.grok_logged_in == Some(false) {
-      worker.state = WorkerState::LoginRequired;
     } else if is_idle {
       worker.state = WorkerState::Ready;
     } else {
@@ -434,17 +506,44 @@ impl WorkerRegistry {
       ));
     }
 
-    // 7. Site-specific session requirements based on capability:
-    // Grok image/video generation requires grok_logged_in == true.
-    // Health checks do NOT require authenticated session (used to inspect health).
-    let is_grok_gen = req.capability.starts_with("grok.image.")
-      || req.capability.starts_with("grok.video.")
-      || req.capability == "grok.generation.status";
-    if is_grok_gen && worker.grok_logged_in != Some(true) {
-      return Err(WorkerError::new(
-        WorkerErrorCode::GrokNotLoggedIn,
-        "Worker requires active Grok authenticated session",
-      ));
+    // 7. Site-specific session requirements based on CapabilityPolicy:
+    // Health capabilities (e.g. social.facebook.health) do NOT require authenticated session (used to inspect session health).
+    // Operations requiring authenticated session (e.g. grok generation, future social publish) verify site session is Ready.
+    if let Some(policy) = CapabilityPolicy::lookup(&req.capability) {
+      if policy.requires_auth {
+        match policy.site {
+          ProductionSite::Grok => {
+            let grok_ready = worker.grok_logged_in == Some(true)
+              || worker
+                .site_sessions
+                .get(&ProductionSite::Grok)
+                .map(|s| s.state == SiteSessionState::Ready)
+                .unwrap_or(false);
+            if !grok_ready {
+              return Err(WorkerError::new(
+                WorkerErrorCode::GrokNotLoggedIn,
+                "Worker requires active Grok authenticated session",
+              ));
+            }
+          }
+          other_site => {
+            let site_ready = worker
+              .site_sessions
+              .get(&other_site)
+              .map(|s| s.state == SiteSessionState::Ready)
+              .unwrap_or(false);
+            if !site_ready {
+              return Err(WorkerError::new(
+                WorkerErrorCode::SiteSessionNotReady,
+                format!(
+                  "Worker requires active authenticated session on {}",
+                  other_site.display_name()
+                ),
+              ));
+            }
+          }
+        }
+      }
     }
 
     Ok(())
@@ -870,6 +969,8 @@ mod tests {
       extension_version: Some("1.1.49".to_string()),
       protocol_version: Some(1),
       grok_logged_in: Some(true),
+      site_sessions: std::collections::HashMap::new(),
+      site_capabilities: std::collections::HashMap::new(),
       current_lease_id: None,
       current_job_id: None,
       last_heartbeat_at: Some(Utc::now().to_rfc3339()),
@@ -909,6 +1010,8 @@ mod tests {
       extension_version: None,
       protocol_version: None,
       grok_logged_in: None,
+      site_sessions: std::collections::HashMap::new(),
+      site_capabilities: std::collections::HashMap::new(),
       current_lease_id: None,
       current_job_id: None,
       last_heartbeat_at: None,
@@ -925,8 +1028,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -950,8 +1055,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await;
@@ -973,8 +1080,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await;
@@ -999,8 +1108,10 @@ mod tests {
           protocol_version: 2, // incompatible
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await;
@@ -1068,8 +1179,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1109,8 +1222,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "BUSY".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1167,8 +1282,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: false,
+          logged_in: Some(false),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1176,7 +1293,12 @@ mod tests {
 
     let state = registry.state.lock().await;
     let w = state.workers.get("WORKER_01").unwrap();
-    assert_eq!(w.state, WorkerState::LoginRequired);
+    // Global WorkerState stays IDLE (Ready) -- browser runtime is idle.
+    // grok_logged_in is stored as false in site_sessions (for eligibility checks).
+    // A Grok logout does NOT globally block the browser worker state.
+    assert_eq!(w.grok_logged_in, Some(false));
+    // State is Ready because extension reports IDLE with no lease
+    assert_eq!(w.state, WorkerState::Ready);
   }
 
   #[tokio::test]
@@ -1248,8 +1370,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "BUSY".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1293,8 +1417,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1318,8 +1444,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await;
@@ -1425,8 +1553,10 @@ mod tests {
           protocol_version: 1,
           extension_version: "1.1.49".to_string(),
           worker_state: "IDLE".to_string(),
-          logged_in: true,
+          logged_in: Some(true),
           capabilities: vec!["grok.image.edit".to_string()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
         },
       )
       .await
@@ -1748,10 +1878,10 @@ mod tests {
     assert!(ProductionSite::TikTok.matches_host("www.tiktok.com"));
     assert!(!ProductionSite::TikTok.matches_host("tiktoker.com"));
 
-    // YouTube Studio
+    // YouTube Studio - Strictly studio.youtube.com ONLY (Section 14)
     assert!(ProductionSite::YouTubeStudio.matches_host("studio.youtube.com"));
-    assert!(ProductionSite::YouTubeStudio.matches_host("youtube.com"));
-    assert!(ProductionSite::YouTubeStudio.matches_host("www.youtube.com"));
+    assert!(!ProductionSite::YouTubeStudio.matches_host("youtube.com"));
+    assert!(!ProductionSite::YouTubeStudio.matches_host("www.youtube.com"));
     assert!(!ProductionSite::YouTubeStudio.matches_host("fakeyoutube.com"));
   }
 
@@ -1759,20 +1889,188 @@ mod tests {
   fn test_known_social_publish_descriptors_are_marked_unimplemented() {
     let fb_desc = ProductionMethodDescriptor::lookup("social.facebook.reels.publish").unwrap();
     assert_eq!(fb_desc.required_capability, "social.facebook.publish");
-    assert_eq!(fb_desc.site, ProductionSite::Facebook);
+    assert_eq!(
+      fb_desc.site_policy,
+      ProductionSitePolicy::Site(ProductionSite::Facebook)
+    );
     assert!(!fb_desc.implemented);
 
     let tt_desc = ProductionMethodDescriptor::lookup("social.tiktok.video.publish").unwrap();
     assert_eq!(tt_desc.required_capability, "social.tiktok.publish");
-    assert_eq!(tt_desc.site, ProductionSite::TikTok);
+    assert_eq!(
+      tt_desc.site_policy,
+      ProductionSitePolicy::Site(ProductionSite::TikTok)
+    );
     assert!(!tt_desc.implemented);
 
     let yt_desc = ProductionMethodDescriptor::lookup("social.youtube.shorts.publish").unwrap();
     assert_eq!(yt_desc.required_capability, "social.youtube.publish");
-    assert_eq!(yt_desc.site, ProductionSite::YouTubeStudio);
+    assert_eq!(
+      yt_desc.site_policy,
+      ProductionSitePolicy::Site(ProductionSite::YouTubeStudio)
+    );
     assert!(!yt_desc.implemented);
 
-    // Unknown method returns None -> PROTOCOL_MISMATCH in router
+    // Cancel descriptor has ActiveTask policy
+    let cancel_desc = ProductionMethodDescriptor::lookup("production.task.cancel").unwrap();
+    assert_eq!(cancel_desc.site_policy, ProductionSitePolicy::ActiveTask);
+
+    // Unknown method returns None
     assert!(ProductionMethodDescriptor::lookup("unknown.method.publish").is_none());
+  }
+
+  #[tokio::test]
+  async fn test_d_h1_multi_site_health_handshake_stores_per_site_sessions_and_aggregates_caps() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
+
+    let mut site_caps = std::collections::HashMap::new();
+    site_caps.insert(
+      "grok".to_string(),
+      vec![
+        "grok.health".to_string(),
+        "grok.image.edit".to_string(),
+        "grok.video.generate".to_string(),
+      ],
+    );
+    site_caps.insert(
+      "facebook".to_string(),
+      vec![
+        "social.facebook.health".to_string(),
+        "social.facebook.publish".to_string(), // Unexecutable publish capability to filter
+      ],
+    );
+    site_caps.insert(
+      "tiktok".to_string(),
+      vec!["social.tiktok.health".to_string()],
+    );
+
+    let handshake = WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: Some(true),
+      capabilities: vec![],
+      site_sessions: vec![
+        WorkerSiteSession {
+          site: ProductionSite::Grok,
+          state: SiteSessionState::Ready,
+          checked_at: Some("2026-08-19T00:00:00Z".to_string()),
+          current_host: Some("grok.com".to_string()),
+          account_identifier: None,
+          message: None,
+        },
+        WorkerSiteSession {
+          site: ProductionSite::Facebook,
+          state: SiteSessionState::AuthRequired,
+          checked_at: Some("2026-08-19T00:00:00Z".to_string()),
+          current_host: Some("facebook.com".to_string()),
+          account_identifier: None,
+          message: Some("Login required".to_string()),
+        },
+      ],
+      site_capabilities: site_caps,
+    };
+
+    registry
+      .handle_health_handshake("WORKER_01", handshake)
+      .await
+      .unwrap();
+
+    let list = registry.list_workers().await;
+    let worker = list
+      .workers
+      .into_iter()
+      .find(|w| w.worker_id == "WORKER_01")
+      .unwrap();
+
+    // 1. Worker remains Ready because browser runtime is IDLE and healthy
+    assert_eq!(worker.state, WorkerState::Ready);
+    assert_eq!(worker.grok_logged_in, Some(true));
+
+    // 2. Per-site session states stored correctly
+    assert_eq!(
+      worker
+        .site_sessions
+        .get(&ProductionSite::Grok)
+        .unwrap()
+        .state,
+      SiteSessionState::Ready
+    );
+    assert_eq!(
+      worker
+        .site_sessions
+        .get(&ProductionSite::Facebook)
+        .unwrap()
+        .state,
+      SiteSessionState::AuthRequired
+    );
+
+    // 3. Capabilities are aggregated and social.facebook.publish is filtered out
+    assert!(worker.capabilities.contains(&"grok.image.edit".to_string()));
+    assert!(worker
+      .capabilities
+      .contains(&"social.facebook.health".to_string()));
+    assert!(worker
+      .capabilities
+      .contains(&"social.tiktok.health".to_string()));
+    assert!(!worker
+      .capabilities
+      .contains(&"social.facebook.publish".to_string()));
+  }
+
+  #[tokio::test]
+  async fn test_d_h2_facebook_logout_does_not_make_grok_unavailable() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_01", "PROFILE_A", None).await;
+
+    let handshake = WorkerHealthHandshakeRequest {
+      profile_id: "PROFILE_A".to_string(),
+      protocol_version: 1,
+      extension_version: "1.1.49".to_string(),
+      worker_state: "IDLE".to_string(),
+      logged_in: Some(true),
+      capabilities: vec!["grok.image.edit".to_string()],
+      site_sessions: vec![
+        WorkerSiteSession {
+          site: ProductionSite::Grok,
+          state: SiteSessionState::Ready,
+          checked_at: Some("2026-08-19T00:00:00Z".to_string()),
+          current_host: Some("grok.com".to_string()),
+          account_identifier: None,
+          message: None,
+        },
+        WorkerSiteSession {
+          site: ProductionSite::Facebook,
+          state: SiteSessionState::AuthRequired,
+          checked_at: Some("2026-08-19T00:00:00Z".to_string()),
+          current_host: Some("facebook.com".to_string()),
+          account_identifier: None,
+          message: Some("Logged out of Facebook".to_string()),
+        },
+      ],
+      site_capabilities: std::collections::HashMap::new(),
+    };
+
+    registry
+      .handle_health_handshake("WORKER_01", handshake)
+      .await
+      .unwrap();
+
+    // Grok acquire must succeed
+    let acq = registry
+      .acquire(AcquireWorkerRequest {
+        job_id: "JOB_GROK".to_string(),
+        step_id: "GENERATING_IMAGE".to_string(),
+        attempt_id: "ATTEMPT_001".to_string(),
+        capability: "grok.image.edit".to_string(),
+        pool_id: None,
+        profile_id: Some("PROFILE_A".to_string()),
+        ttl_seconds: Some(120),
+      })
+      .await;
+
+    assert!(acq.is_ok());
   }
 }
