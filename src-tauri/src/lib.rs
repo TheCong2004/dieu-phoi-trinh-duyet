@@ -36,6 +36,7 @@ fn e2e_automation_enabled() -> bool {
 }
 
 #[cfg(feature = "e2e")]
+#[allow(dead_code)]
 fn e2e_automation_profile_dir() -> Option<std::path::PathBuf> {
   e2e_automation_enabled()
     .then(|| std::env::var_os("TAURI_AUTOMATION_PROFILE_DIR").map(std::path::PathBuf::from))
@@ -1656,11 +1657,10 @@ pub fn run_headless() {
   builder
     .build(tauri::generate_context!())
     .expect("failed to build Floword Donut runtime")
-    .run(|_app_handle, event| match event {
-      tauri::RunEvent::ExitRequested { api, .. } => {
+    .run(|_app_handle, event| {
+      if let tauri::RunEvent::ExitRequested { api, .. } = event {
         api.prevent_exit();
       }
-      _ => {}
     });
 }
 

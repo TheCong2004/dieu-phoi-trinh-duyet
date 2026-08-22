@@ -488,7 +488,6 @@ impl BrowserRunner {
       // `match_profile_fingerprint_to_exit`.
 
       // Always force persistent storage for user profiles so logins (Grok, ChatGPT, Social) are preserved permanently
-      let mut updated_profile = updated_profile;
       updated_profile.ephemeral = false;
       updated_profile.clear_on_close = false;
 

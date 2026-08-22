@@ -179,19 +179,12 @@ impl WorkerRegistry {
           worker_id: worker_id.clone(),
           profile_id: profile.id.to_string(),
           pool_id: profile.group_id.clone(),
-          state: WorkerState::Ready,
-          capabilities: vec![
-            "grok.image.edit".to_string(),
-            "grok.expand.9_16".to_string(),
-            "grok.video.generate".to_string(),
-            "social.facebook.publish".to_string(),
-            "social.tiktok.publish".to_string(),
-            "social.youtube.publish".to_string(),
-          ],
-          extension_ready: true,
-          extension_version: Some("1.0.0".to_string()),
-          protocol_version: Some(1),
-          grok_logged_in: Some(true),
+          state: default_state,
+          capabilities: vec![],
+          extension_ready: false,
+          extension_version: None,
+          protocol_version: None,
+          grok_logged_in: None,
           site_sessions: std::collections::HashMap::new(),
           site_capabilities: std::collections::HashMap::new(),
           current_lease_id: None,
@@ -457,10 +450,7 @@ impl WorkerRegistry {
     }
 
     // 3. Capability constraint (CRITICAL: Every acquire MUST match capability, pinned or unpinned)
-    if !worker.capabilities.contains(&req.capability)
-      && !req.capability.starts_with("grok.")
-      && !req.capability.starts_with("social.")
-    {
+    if !worker.capabilities.contains(&req.capability) {
       return Err(WorkerError::new(
         WorkerErrorCode::CapabilityUnavailable,
         format!(
@@ -516,13 +506,13 @@ impl WorkerRegistry {
       if policy.requires_auth {
         match policy.site {
           ProductionSite::Grok => {
-            let grok_ready = worker.grok_logged_in.unwrap_or(true)
+            let grok_ready = worker.grok_logged_in == Some(true)
               || worker
                 .site_sessions
                 .get(&ProductionSite::Grok)
                 .map(|s| s.state == SiteSessionState::Ready)
-                .unwrap_or(true);
-            if !grok_ready && worker.grok_logged_in == Some(false) {
+                .unwrap_or(false);
+            if !grok_ready {
               return Err(WorkerError::new(
                 WorkerErrorCode::GrokNotLoggedIn,
                 "Worker requires active Grok authenticated session",

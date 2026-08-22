@@ -432,7 +432,6 @@ pub async fn dispatch_to_profile_extension(
   // 2. Strict target selection with safe hostname boundary matching and multi-tab guard
   let mut matching_targets: Vec<serde_json::Value> = targets
     .iter()
-    .cloned()
     .filter(|t| {
       let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
       if t_type != "page" {
@@ -446,6 +445,7 @@ pub async fn dispatch_to_profile_extension(
       }
       false
     })
+    .cloned()
     .collect();
 
   // Auto-open / navigate site tab if not currently open
@@ -696,260 +696,26 @@ pub async fn dispatch_to_profile_extension(
     }})"#
   );
 
+  const MIN_METHOD_TIMEOUT_MS: u64 = 10_000;
+  const MAX_METHOD_TIMEOUT_MS: u64 = 600_000;
+
   let timeout_ms = payload
     .get("params")
     .and_then(|p| p.get("timeoutMs"))
     .and_then(|v| v.as_u64())
-    .unwrap_or(180_000);
+    .unwrap_or(180_000)
+    .clamp(MIN_METHOD_TIMEOUT_MS, MAX_METHOD_TIMEOUT_MS);
   let method_dur = Duration::from_millis(timeout_ms + 5_000);
 
-  let prod_result = match send_cdp_evaluate(
+  let prod_result = send_cdp_evaluate(
     &mut ws_stream,
     1001,
     &exec_expr,
     target_context_id,
-    Duration::from_millis(500),
+    method_dur,
   )
-  .await
-  {
-    Ok(val) => val,
-    Err(e) => {
-      log::info!(
-        "[WorkerDispatch] CDP evaluate ({}); executing via Page.navigate DOM bridge...",
-        e.message
-      );
-      execute_via_page_navigate_dom(&mut ws_stream, payload, method_dur).await?
-    }
-  };
+  .await?;
   Ok(prod_result)
-}
-
-async fn execute_via_page_navigate_dom(
-  ws_stream: &mut tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-  >,
-  payload: &serde_json::Value,
-  timeout_dur: Duration,
-) -> Result<serde_json::Value, WorkerError> {
-  use base64::Engine;
-  let payload_json_str = serde_json::to_string(payload).unwrap_or_default();
-  let b64 = base64::engine::general_purpose::STANDARD.encode(payload_json_str.as_bytes());
-
-  // 1. Enable DOM and Page domains
-  let enable_dom = serde_json::json!({ "id": 501, "method": "DOM.enable" });
-  let _ = ws_stream
-    .send(Message::Text(enable_dom.to_string().into()))
-    .await;
-
-  let enable_page = serde_json::json!({ "id": 502, "method": "Page.enable" });
-  let _ = ws_stream
-    .send(Message::Text(enable_page.to_string().into()))
-    .await;
-
-  // 2. Resolve document root and HTML element nodeId with retry loop
-  let mut root_node_id = 1i64;
-  let mut html_node_id = 0i64;
-
-  for _attempt in 0..15 {
-    let get_doc_req =
-      serde_json::json!({ "id": 504, "method": "DOM.getDocument", "params": { "depth": -1 } });
-    let _ = ws_stream
-      .send(Message::Text(get_doc_req.to_string().into()))
-      .await;
-
-    let drain_doc = tokio::time::Instant::now() + Duration::from_millis(300);
-    while tokio::time::Instant::now() < drain_doc {
-      if let Ok(Some(Ok(Message::Text(t)))) =
-        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
-      {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
-          if resp.get("id") == Some(&serde_json::json!(504)) {
-            if let Some(root) = resp.get("result").and_then(|r| r.get("root")) {
-              if let Some(nid) = root.get("nodeId").and_then(|v| v.as_i64()) {
-                root_node_id = nid;
-              }
-              if let Some(children) = root.get("children").and_then(|c| c.as_array()) {
-                for child in children {
-                  if child.get("nodeName").and_then(|n| n.as_str()) == Some("HTML") {
-                    if let Some(nid) = child.get("nodeId").and_then(|v| v.as_i64()) {
-                      html_node_id = nid;
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if html_node_id > 1 {
-      break;
-    }
-
-    // Try DOM.querySelector for "html"
-    let query_html = serde_json::json!({
-      "id": 505,
-      "method": "DOM.querySelector",
-      "params": {
-        "nodeId": if root_node_id > 0 { root_node_id } else { 1 },
-        "selector": "html"
-      }
-    });
-    let _ = ws_stream
-      .send(Message::Text(query_html.to_string().into()))
-      .await;
-    let drain_q = tokio::time::Instant::now() + Duration::from_millis(300);
-    while tokio::time::Instant::now() < drain_q {
-      if let Ok(Some(Ok(Message::Text(t)))) =
-        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
-      {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
-          if resp.get("id") == Some(&serde_json::json!(505)) {
-            if let Some(nid) = resp
-              .get("result")
-              .and_then(|r| r.get("nodeId"))
-              .and_then(|v| v.as_i64())
-            {
-              if nid > 1 {
-                html_node_id = nid;
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if html_node_id > 1 {
-      break;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-  }
-
-  if html_node_id <= 1 {
-    html_node_id = if root_node_id > 1 { root_node_id } else { 3 };
-  }
-
-  log::info!(
-    "[WorkerDispatch] Resolved HTML element nodeId: {html_node_id} (root: {root_node_id})"
-  );
-
-  let req_id = payload
-    .get("requestId")
-    .and_then(|v| v.as_str())
-    .unwrap_or("default");
-  let req_attr = format!("data-floword-req-{req_id}").to_ascii_lowercase();
-  let res_attr = format!("data-floword-res-{req_id}").to_ascii_lowercase();
-  let err_attr = format!("data-floword-err-{req_id}").to_ascii_lowercase();
-
-  // 3. Remove old result / error attributes for this specific request only
-  for attr_name in &[&res_attr, &err_attr, &req_attr] {
-    let remove_req = serde_json::json!({
-      "id": 506,
-      "method": "DOM.removeAttribute",
-      "params": {
-        "nodeId": html_node_id,
-        "name": attr_name
-      }
-    });
-    let _ = ws_stream
-      .send(Message::Text(remove_req.to_string().into()))
-      .await;
-  }
-  tokio::time::sleep(Duration::from_millis(100)).await;
-
-  // 4. Set payload via DOM.setAttributeValue on the HTML element
-  let set_attr_req = serde_json::json!({
-    "id": 507,
-    "method": "DOM.setAttributeValue",
-    "params": {
-      "nodeId": html_node_id,
-      "name": &req_attr,
-      "value": b64
-    }
-  });
-  let _ = ws_stream
-    .send(Message::Text(set_attr_req.to_string().into()))
-    .await;
-  log::info!(
-    "[WorkerDispatch] Injected {req_attr} (b64 length: {}) on HTML node {html_node_id}",
-    b64.len()
-  );
-
-  // 5. Poll DOM attributes for result
-  let start_time = tokio::time::Instant::now();
-  let mut poll_cmd_id = 600u64;
-
-  while start_time.elapsed() < timeout_dur {
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    poll_cmd_id += 1;
-    let attr_cmd_id = poll_cmd_id;
-    let get_attrs = serde_json::json!({
-      "id": attr_cmd_id,
-      "method": "DOM.getAttributes",
-      "params": { "nodeId": html_node_id }
-    });
-    let _ = ws_stream
-      .send(Message::Text(get_attrs.to_string().into()))
-      .await;
-
-    let drain_until = tokio::time::Instant::now() + Duration::from_millis(300);
-    while tokio::time::Instant::now() < drain_until {
-      if let Ok(Some(Ok(Message::Text(t)))) =
-        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
-      {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
-          if resp.get("id") == Some(&serde_json::json!(attr_cmd_id)) {
-            if let Some(attrs) = resp
-              .get("result")
-              .and_then(|r| r.get("attributes"))
-              .and_then(|a| a.as_array())
-            {
-              for chunk in attrs.chunks(2) {
-                if let (Some(k), Some(v)) = (
-                  chunk.get(0).and_then(|s| s.as_str()),
-                  chunk.get(1).and_then(|s| s.as_str()),
-                ) {
-                  let k_lower = k.to_ascii_lowercase();
-                  let req_id_lower = req_id.to_ascii_lowercase();
-                  if k_lower == err_attr
-                    || (k_lower.starts_with("data-floword-err") && k_lower.contains(&req_id_lower))
-                    || (req_id == "default" && k_lower == "data-floword-err")
-                  {
-                    log::error!("[WorkerDispatch] Received error from DOM for {req_id}: {v}");
-                    return Err(WorkerError::new(
-                      WorkerErrorCode::BridgeDisconnected,
-                      format!("Extension error: {v}"),
-                    ));
-                  }
-                  if k_lower == res_attr
-                    || (k_lower.starts_with("data-floword-res") && k_lower.contains(&req_id_lower))
-                    || (req_id == "default" && k_lower == "data-floword-res")
-                  {
-                    log::info!(
-                      "[WorkerDispatch] Received result from DOM for {req_id}! (length: {})",
-                      v.len()
-                    );
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(v) {
-                      return Ok(val);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  Err(WorkerError::new(
-    WorkerErrorCode::BridgeTimeout,
-    format!("Execution timed out after {timeout_dur:?}"),
-  ))
 }
 
 /// Active health probe from Donut Browser to Extension instance across all sites.
@@ -1057,7 +823,7 @@ pub async fn probe_worker_health(
     ),
   ];
 
-  for (site, health_method, site_key) in sites_to_probe {
+  for (site, _health_method, site_key) in sites_to_probe {
     let matching: Vec<&serde_json::Value> = targets
       .iter()
       .filter(|t| {
@@ -1077,25 +843,86 @@ pub async fn probe_worker_health(
 
     if !matching.is_empty() {
       if site == ProductionSite::Grok {
-        grok_logged_in = Some(true);
-        site_sessions.push(WorkerSiteSession {
-          site: ProductionSite::Grok,
-          state: SiteSessionState::Ready,
-          checked_at: Some(chrono::Utc::now().to_rfc3339()),
-          current_host: Some("grok.com".to_string()),
-          account_identifier: None,
-          message: None,
+        let health_req = serde_json::json!({
+          "protocol": "floword-production",
+          "protocolVersion": 1,
+          "requestId": format!("HEALTH_{}", Uuid::new_v4()),
+          "jobId": "HEALTH",
+          "stepId": "HEALTH",
+          "attemptId": "HEALTH",
+          "leaseId": "HEALTH",
+          "profileId": profile_id,
+          "method": "grok.health",
+          "params": {},
+          "createdAt": chrono::Utc::now().to_rfc3339()
         });
-        site_capabilities.insert(
-          "grok".to_string(),
-          vec![
-            "grok.image.edit".to_string(),
-            "grok.expand.9_16".to_string(),
-            "grok.video.generate".to_string(),
-            "grok.video.upscale".to_string(),
-            "grok.prompt.queue".to_string(),
-          ],
-        );
+
+        match dispatch_to_profile_extension(profile_id, &health_req).await {
+          Ok(res) if res.get("ok") == Some(&serde_json::json!(true)) => {
+            let result = res.get("result").cloned().unwrap_or_default();
+            let is_logged_in = result
+              .get("loggedIn")
+              .and_then(|v| v.as_bool())
+              .unwrap_or(false);
+            let ext_ver = result
+              .get("extensionVersion")
+              .and_then(|v| v.as_str())
+              .unwrap_or("1.1.49");
+            let status_str = result
+              .get("status")
+              .and_then(|v| v.as_str())
+              .unwrap_or("UNKNOWN");
+            let reported_caps = result
+              .get("capabilities")
+              .and_then(|v| v.as_array())
+              .map(|arr| {
+                arr
+                  .iter()
+                  .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                  .collect::<Vec<String>>()
+              })
+              .unwrap_or_else(|| {
+                vec![
+                  "grok.image.edit".to_string(),
+                  "grok.image.expand_9_16".to_string(),
+                  "grok.video.generate".to_string(),
+                ]
+              });
+
+            extension_version = ext_ver.to_string();
+            grok_logged_in = Some(is_logged_in);
+            if status_str == "READY" && is_logged_in {
+              overall_worker_state = "READY".to_string();
+            }
+
+            site_sessions.push(WorkerSiteSession {
+              site: ProductionSite::Grok,
+              state: if is_logged_in && status_str == "READY" {
+                SiteSessionState::Ready
+              } else if !is_logged_in || status_str == "LOGIN_REQUIRED" {
+                SiteSessionState::AuthRequired
+              } else {
+                SiteSessionState::Unknown
+              },
+              checked_at: Some(chrono::Utc::now().to_rfc3339()),
+              current_host: Some("grok.com".to_string()),
+              account_identifier: None,
+              message: None,
+            });
+            site_capabilities.insert("grok".to_string(), reported_caps);
+          }
+          _ => {
+            grok_logged_in = Some(false);
+            site_sessions.push(WorkerSiteSession {
+              site: ProductionSite::Grok,
+              state: SiteSessionState::Unknown,
+              checked_at: Some(chrono::Utc::now().to_rfc3339()),
+              current_host: Some("grok.com".to_string()),
+              account_identifier: None,
+              message: Some("Grok health probe failed or extension not responding".to_string()),
+            });
+          }
+        }
       } else {
         site_sessions.push(WorkerSiteSession {
           site,
@@ -1274,31 +1101,15 @@ pub async fn dispatch_worker_handler(
     }
   };
 
-  // 6. Worker / Profile ID check: URL path worker_id matches lease.worker_id or lease.profile_id
-  let norm_url = worker_id
-    .strip_prefix("browser-profile:")
-    .unwrap_or(&worker_id);
-  let norm_lease = lease
-    .worker_id
-    .strip_prefix("browser-profile:")
-    .unwrap_or(&lease.worker_id);
-  let norm_profile = lease
-    .profile_id
-    .strip_prefix("browser-profile:")
-    .unwrap_or(&lease.profile_id);
-
-  if worker_id != lease.worker_id
-    && norm_url != norm_lease
-    && norm_url != norm_profile
-    && worker_id != lease.profile_id
-  {
+  // 6. Strict Worker ID check: URL path worker_id MUST strictly match lease.worker_id
+  if worker_id != lease.worker_id {
     return Err((
       StatusCode::BAD_REQUEST,
       Json(serde_json::json!({
         "error": {
           "code": "INVALID_LEASE",
           "message": format!(
-            "Dispatch worker_id '{worker_id}' does not match lease worker_id '{}'",
+            "URL path worker_id '{worker_id}' does not match lease worker_id '{}'",
             lease.worker_id
           )
         }

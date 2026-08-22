@@ -1232,10 +1232,10 @@ impl WayfernManager {
           .filter(|s| s.len() == 36 && s.contains('-'))
           .any(|uuid| norm_inst.contains(uuid));
 
-        if instance_path == target_path || path == profile_path || uuid_matched {
-          if instance.cdp_port.is_some() {
-            return instance.cdp_port;
-          }
+        if (instance_path == target_path || path == profile_path || uuid_matched)
+          && instance.cdp_port.is_some()
+        {
+          return instance.cdp_port;
         }
       }
     }
