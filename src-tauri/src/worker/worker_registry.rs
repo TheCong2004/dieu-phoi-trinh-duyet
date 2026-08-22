@@ -322,7 +322,13 @@ impl WorkerRegistry {
       .collect();
     all_caps.sort();
     all_caps.dedup();
-    for default_cap in ["grok.image.edit", "grok.expand.9_16", "grok.video.generate", "grok.video.upscale", "grok.prompt.queue"] {
+    for default_cap in [
+      "grok.image.edit",
+      "grok.expand.9_16",
+      "grok.video.generate",
+      "grok.video.upscale",
+      "grok.prompt.queue",
+    ] {
       if !all_caps.iter().any(|c| c == default_cap) {
         all_caps.push(default_cap.to_string());
       }

@@ -340,10 +340,14 @@ pub async fn dispatch_to_profile_extension(
     })?;
 
   // 1. Strict profile ID match (no display name fallback)
-  let clean_profile_id = profile_id.strip_prefix("browser-profile:").unwrap_or(profile_id);
+  let clean_profile_id = profile_id
+    .strip_prefix("browser-profile:")
+    .unwrap_or(profile_id);
   let profile = profiles
     .into_iter()
-    .find(|p| p.id.to_string() == clean_profile_id || format!("browser-profile:{}", p.id) == profile_id)
+    .find(|p| {
+      p.id.to_string() == clean_profile_id || format!("browser-profile:{}", p.id) == profile_id
+    })
     .ok_or_else(|| {
       WorkerError::new(
         WorkerErrorCode::InvalidProfile,
@@ -360,7 +364,9 @@ pub async fn dispatch_to_profile_extension(
 
   // Auto-launch fallback if browser profile is currently stopped
   if cdp_port_opt.is_none() {
-    log::info!("[WorkerDispatch] Profile '{profile_id}' not running; auto-launching browser profile...");
+    log::info!(
+      "[WorkerDispatch] Profile '{profile_id}' not running; auto-launching browser profile..."
+    );
     let target_site_url = match site {
       ProductionSite::Grok => "https://grok.com/imagine",
       ProductionSite::Facebook => "https://www.facebook.com",
@@ -368,13 +374,20 @@ pub async fn dispatch_to_profile_extension(
       ProductionSite::YouTubeStudio => "https://studio.youtube.com",
     };
 
-    let http_client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().ok();
+    let http_client = reqwest::Client::builder()
+      .timeout(Duration::from_secs(5))
+      .build()
+      .ok();
     if let Some(client) = http_client {
       let run_url = format!("http://127.0.0.1:10108/v1/profiles/{clean_profile_id}/run");
-      let _ = client.post(&run_url).json(&serde_json::json!({
-        "url": target_site_url,
-        "headless": false,
-      })).send().await;
+      let _ = client
+        .post(&run_url)
+        .json(&serde_json::json!({
+          "url": target_site_url,
+          "headless": false,
+        }))
+        .send()
+        .await;
     }
 
     // Wait up to 15 seconds for browser process and CDP port to bind
@@ -443,7 +456,11 @@ pub async fn dispatch_to_profile_extension(
       ProductionSite::TikTok => "https://www.tiktok.com",
       ProductionSite::YouTubeStudio => "https://studio.youtube.com",
     };
-    log::info!("[WorkerDispatch] No active {} tab found; auto-navigating/opening tab: {}", site.display_name(), target_site_url);
+    log::info!(
+      "[WorkerDispatch] No active {} tab found; auto-navigating/opening tab: {}",
+      site.display_name(),
+      target_site_url
+    );
 
     // If an existing blank/new tab is present, navigate it via CDP
     let blank_target = targets.iter().find(|t| {
@@ -452,7 +469,10 @@ pub async fn dispatch_to_profile_extension(
         return false;
       }
       let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
-      t_url.is_empty() || t_url == "about:blank" || t_url.starts_with("chrome://") || t_url.starts_with("chrome-search://")
+      t_url.is_empty()
+        || t_url == "about:blank"
+        || t_url.starts_with("chrome://")
+        || t_url.starts_with("chrome-search://")
     });
 
     if let Some(bt) = blank_target {
@@ -495,7 +515,10 @@ pub async fn dispatch_to_profile_extension(
             })
             .collect();
           if !matching_targets.is_empty() {
-            log::info!("[WorkerDispatch] Auto-navigation to {} successful", site.display_name());
+            log::info!(
+              "[WorkerDispatch] Auto-navigation to {} successful",
+              site.display_name()
+            );
             break;
           }
         }
@@ -517,7 +540,10 @@ pub async fn dispatch_to_profile_extension(
   let target = if matching_targets.len() == 1 {
     matching_targets.remove(0)
   } else if let Some(pos) = matching_targets.iter().position(|t| {
-    t.get("url").and_then(|v| v.as_str()).map(|u| u.contains("/imagine")).unwrap_or(false)
+    t.get("url")
+      .and_then(|v| v.as_str())
+      .map(|u| u.contains("/imagine"))
+      .unwrap_or(false)
   }) {
     matching_targets.remove(pos)
   } else {
@@ -551,7 +577,9 @@ pub async fn dispatch_to_profile_extension(
         "url": "https://grok.com/imagine"
       }
     });
-    let _ = ws_stream.send(Message::Text(nav_cmd.to_string().into())).await;
+    let _ = ws_stream
+      .send(Message::Text(nav_cmd.to_string().into()))
+      .await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
   }
 
@@ -686,7 +714,10 @@ pub async fn dispatch_to_profile_extension(
   {
     Ok(val) => val,
     Err(e) => {
-      log::info!("[WorkerDispatch] CDP evaluate ({}); executing via Page.navigate DOM bridge...", e.message);
+      log::info!(
+        "[WorkerDispatch] CDP evaluate ({}); executing via Page.navigate DOM bridge...",
+        e.message
+      );
       execute_via_page_navigate_dom(&mut ws_stream, payload, method_dur).await?
     }
   };
@@ -694,7 +725,9 @@ pub async fn dispatch_to_profile_extension(
 }
 
 async fn execute_via_page_navigate_dom(
-  ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+  ws_stream: &mut tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+  >,
   payload: &serde_json::Value,
   timeout_dur: Duration,
 ) -> Result<serde_json::Value, WorkerError> {
@@ -704,22 +737,31 @@ async fn execute_via_page_navigate_dom(
 
   // 1. Enable DOM and Page domains
   let enable_dom = serde_json::json!({ "id": 501, "method": "DOM.enable" });
-  let _ = ws_stream.send(Message::Text(enable_dom.to_string().into())).await;
+  let _ = ws_stream
+    .send(Message::Text(enable_dom.to_string().into()))
+    .await;
 
   let enable_page = serde_json::json!({ "id": 502, "method": "Page.enable" });
-  let _ = ws_stream.send(Message::Text(enable_page.to_string().into())).await;
+  let _ = ws_stream
+    .send(Message::Text(enable_page.to_string().into()))
+    .await;
 
   // 2. Resolve document root and HTML element nodeId with retry loop
   let mut root_node_id = 1i64;
   let mut html_node_id = 0i64;
 
   for _attempt in 0..15 {
-    let get_doc_req = serde_json::json!({ "id": 504, "method": "DOM.getDocument", "params": { "depth": -1 } });
-    let _ = ws_stream.send(Message::Text(get_doc_req.to_string().into())).await;
+    let get_doc_req =
+      serde_json::json!({ "id": 504, "method": "DOM.getDocument", "params": { "depth": -1 } });
+    let _ = ws_stream
+      .send(Message::Text(get_doc_req.to_string().into()))
+      .await;
 
     let drain_doc = tokio::time::Instant::now() + Duration::from_millis(300);
     while tokio::time::Instant::now() < drain_doc {
-      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+      if let Ok(Some(Ok(Message::Text(t)))) =
+        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
+      {
         if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
           if resp.get("id") == Some(&serde_json::json!(504)) {
             if let Some(root) = resp.get("result").and_then(|r| r.get("root")) {
@@ -755,13 +797,21 @@ async fn execute_via_page_navigate_dom(
         "selector": "html"
       }
     });
-    let _ = ws_stream.send(Message::Text(query_html.to_string().into())).await;
+    let _ = ws_stream
+      .send(Message::Text(query_html.to_string().into()))
+      .await;
     let drain_q = tokio::time::Instant::now() + Duration::from_millis(300);
     while tokio::time::Instant::now() < drain_q {
-      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+      if let Ok(Some(Ok(Message::Text(t)))) =
+        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
+      {
         if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
           if resp.get("id") == Some(&serde_json::json!(505)) {
-            if let Some(nid) = resp.get("result").and_then(|r| r.get("nodeId")).and_then(|v| v.as_i64()) {
+            if let Some(nid) = resp
+              .get("result")
+              .and_then(|r| r.get("nodeId"))
+              .and_then(|v| v.as_i64())
+            {
               if nid > 1 {
                 html_node_id = nid;
                 break;
@@ -782,9 +832,14 @@ async fn execute_via_page_navigate_dom(
     html_node_id = if root_node_id > 1 { root_node_id } else { 3 };
   }
 
-  log::info!("[WorkerDispatch] Resolved HTML element nodeId: {html_node_id} (root: {root_node_id})");
+  log::info!(
+    "[WorkerDispatch] Resolved HTML element nodeId: {html_node_id} (root: {root_node_id})"
+  );
 
-  let req_id = payload.get("requestId").and_then(|v| v.as_str()).unwrap_or("default");
+  let req_id = payload
+    .get("requestId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("default");
   let req_attr = format!("data-floword-req-{req_id}").to_ascii_lowercase();
   let res_attr = format!("data-floword-res-{req_id}").to_ascii_lowercase();
   let err_attr = format!("data-floword-err-{req_id}").to_ascii_lowercase();
@@ -799,7 +854,9 @@ async fn execute_via_page_navigate_dom(
         "name": attr_name
       }
     });
-    let _ = ws_stream.send(Message::Text(remove_req.to_string().into())).await;
+    let _ = ws_stream
+      .send(Message::Text(remove_req.to_string().into()))
+      .await;
   }
   tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -813,8 +870,13 @@ async fn execute_via_page_navigate_dom(
       "value": b64
     }
   });
-  let _ = ws_stream.send(Message::Text(set_attr_req.to_string().into())).await;
-  log::info!("[WorkerDispatch] Injected {req_attr} (b64 length: {}) on HTML node {html_node_id}", b64.len());
+  let _ = ws_stream
+    .send(Message::Text(set_attr_req.to_string().into()))
+    .await;
+  log::info!(
+    "[WorkerDispatch] Injected {req_attr} (b64 length: {}) on HTML node {html_node_id}",
+    b64.len()
+  );
 
   // 5. Poll DOM attributes for result
   let start_time = tokio::time::Instant::now();
@@ -830,24 +892,47 @@ async fn execute_via_page_navigate_dom(
       "method": "DOM.getAttributes",
       "params": { "nodeId": html_node_id }
     });
-    let _ = ws_stream.send(Message::Text(get_attrs.to_string().into())).await;
+    let _ = ws_stream
+      .send(Message::Text(get_attrs.to_string().into()))
+      .await;
 
     let drain_until = tokio::time::Instant::now() + Duration::from_millis(300);
     while tokio::time::Instant::now() < drain_until {
-      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+      if let Ok(Some(Ok(Message::Text(t)))) =
+        tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await
+      {
         if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
           if resp.get("id") == Some(&serde_json::json!(attr_cmd_id)) {
-            if let Some(attrs) = resp.get("result").and_then(|r| r.get("attributes")).and_then(|a| a.as_array()) {
+            if let Some(attrs) = resp
+              .get("result")
+              .and_then(|r| r.get("attributes"))
+              .and_then(|a| a.as_array())
+            {
               for chunk in attrs.chunks(2) {
-                if let (Some(k), Some(v)) = (chunk.get(0).and_then(|s| s.as_str()), chunk.get(1).and_then(|s| s.as_str())) {
+                if let (Some(k), Some(v)) = (
+                  chunk.get(0).and_then(|s| s.as_str()),
+                  chunk.get(1).and_then(|s| s.as_str()),
+                ) {
                   let k_lower = k.to_ascii_lowercase();
                   let req_id_lower = req_id.to_ascii_lowercase();
-                  if k_lower == err_attr || (k_lower.starts_with("data-floword-err") && k_lower.contains(&req_id_lower)) || (req_id == "default" && k_lower == "data-floword-err") {
+                  if k_lower == err_attr
+                    || (k_lower.starts_with("data-floword-err") && k_lower.contains(&req_id_lower))
+                    || (req_id == "default" && k_lower == "data-floword-err")
+                  {
                     log::error!("[WorkerDispatch] Received error from DOM for {req_id}: {v}");
-                    return Err(WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Extension error: {v}")));
+                    return Err(WorkerError::new(
+                      WorkerErrorCode::BridgeDisconnected,
+                      format!("Extension error: {v}"),
+                    ));
                   }
-                  if k_lower == res_attr || (k_lower.starts_with("data-floword-res") && k_lower.contains(&req_id_lower)) || (req_id == "default" && k_lower == "data-floword-res") {
-                    log::info!("[WorkerDispatch] Received result from DOM for {req_id}! (length: {})", v.len());
+                  if k_lower == res_attr
+                    || (k_lower.starts_with("data-floword-res") && k_lower.contains(&req_id_lower))
+                    || (req_id == "default" && k_lower == "data-floword-res")
+                  {
+                    log::info!(
+                      "[WorkerDispatch] Received result from DOM for {req_id}! (length: {})",
+                      v.len()
+                    );
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(v) {
                       return Ok(val);
                     }
@@ -861,7 +946,10 @@ async fn execute_via_page_navigate_dom(
     }
   }
 
-  Err(WorkerError::new(WorkerErrorCode::BridgeTimeout, format!("Execution timed out after {timeout_dur:?}")))
+  Err(WorkerError::new(
+    WorkerErrorCode::BridgeTimeout,
+    format!("Execution timed out after {timeout_dur:?}"),
+  ))
 }
 
 /// Active health probe from Donut Browser to Extension instance across all sites.
@@ -888,8 +976,15 @@ pub async fn probe_worker_health(
 
   // If worker is currently busy running a leased task, skip active health probe to avoid DOM collision
   let workers_list = WORKER_REGISTRY.list_workers().await;
-  if let Some(w) = workers_list.workers.into_iter().find(|w| w.profile_id == profile_id) {
-    if w.current_lease_id.is_some() || w.state == WorkerState::Busy || w.state == WorkerState::Leased {
+  if let Some(w) = workers_list
+    .workers
+    .into_iter()
+    .find(|w| w.profile_id == profile_id)
+  {
+    if w.current_lease_id.is_some()
+      || w.state == WorkerState::Busy
+      || w.state == WorkerState::Leased
+    {
       return Ok(WorkerHealthHandshakeRequest {
         profile_id: profile_id.to_string(),
         protocol_version: 1,
@@ -1180,11 +1275,23 @@ pub async fn dispatch_worker_handler(
   };
 
   // 6. Worker / Profile ID check: URL path worker_id matches lease.worker_id or lease.profile_id
-  let norm_url = worker_id.strip_prefix("browser-profile:").unwrap_or(&worker_id);
-  let norm_lease = lease.worker_id.strip_prefix("browser-profile:").unwrap_or(&lease.worker_id);
-  let norm_profile = lease.profile_id.strip_prefix("browser-profile:").unwrap_or(&lease.profile_id);
+  let norm_url = worker_id
+    .strip_prefix("browser-profile:")
+    .unwrap_or(&worker_id);
+  let norm_lease = lease
+    .worker_id
+    .strip_prefix("browser-profile:")
+    .unwrap_or(&lease.worker_id);
+  let norm_profile = lease
+    .profile_id
+    .strip_prefix("browser-profile:")
+    .unwrap_or(&lease.profile_id);
 
-  if worker_id != lease.worker_id && norm_url != norm_lease && norm_url != norm_profile && worker_id != lease.profile_id {
+  if worker_id != lease.worker_id
+    && norm_url != norm_lease
+    && norm_url != norm_profile
+    && worker_id != lease.profile_id
+  {
     return Err((
       StatusCode::BAD_REQUEST,
       Json(serde_json::json!({

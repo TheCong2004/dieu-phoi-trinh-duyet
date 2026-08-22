@@ -1656,13 +1656,11 @@ pub fn run_headless() {
   builder
     .build(tauri::generate_context!())
     .expect("failed to build Floword Donut runtime")
-    .run(|_app_handle, event| {
-      match event {
-        tauri::RunEvent::ExitRequested { api, .. } => {
-          api.prevent_exit();
-        }
-        _ => {}
+    .run(|_app_handle, event| match event {
+      tauri::RunEvent::ExitRequested { api, .. } => {
+        api.prevent_exit();
       }
+      _ => {}
     });
 }
 
