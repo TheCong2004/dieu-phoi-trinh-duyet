@@ -26,6 +26,19 @@ fn resource_zip_path<R: tauri::Runtime>(
   file_name: &str,
 ) -> Option<PathBuf> {
   use tauri::Manager;
+  if let Some(root) = std::env::var_os("FLOWORD_DONUT_RESOURCE_ROOT") {
+    let root = PathBuf::from(root);
+    let candidates = [
+      root.join("bundled-extensions").join(file_name),
+      root.join(file_name),
+    ];
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+      return Some(path);
+    }
+    log::warn!(
+      "FLOWORD_DONUT_RESOURCE_ROOT is set but bundled extension '{file_name}' was not found"
+    );
+  }
   let dir = app_handle.path().resource_dir().ok()?;
   let path = dir.join("bundled-extensions").join(file_name);
   path.exists().then_some(path)

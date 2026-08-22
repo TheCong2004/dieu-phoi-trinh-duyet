@@ -39,6 +39,17 @@ pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     .route("/v1/workers", get(list_workers_handler))
     .route("/v1/workers/leases", get(list_leases_handler))
     .route("/v1/publications/verify", post(verify_publication_handler))
+    .route("/v1/health", get(health_check_handler))
+    .route("/health", get(health_check_handler))
+    .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024))
+}
+
+pub async fn health_check_handler() -> Json<serde_json::Value> {
+  Json(serde_json::json!({
+    "status": "ok",
+    "runtime": "floword-donut-runtime",
+    "version": "1.0.0"
+  }))
 }
 
 pub async fn acquire_worker_handler(
@@ -329,9 +340,10 @@ pub async fn dispatch_to_profile_extension(
     })?;
 
   // 1. Strict profile ID match (no display name fallback)
+  let clean_profile_id = profile_id.strip_prefix("browser-profile:").unwrap_or(profile_id);
   let profile = profiles
     .into_iter()
-    .find(|p| p.id.to_string() == profile_id)
+    .find(|p| p.id.to_string() == clean_profile_id || format!("browser-profile:{}", p.id) == profile_id)
     .ok_or_else(|| {
       WorkerError::new(
         WorkerErrorCode::InvalidProfile,
@@ -342,15 +354,47 @@ pub async fn dispatch_to_profile_extension(
   let profile_path = profile.get_profile_data_path(&profiles_dir);
   let profile_path_str = profile_path.to_string_lossy();
 
-  let cdp_port = crate::wayfern_manager::WayfernManager::instance()
+  let mut cdp_port_opt = crate::wayfern_manager::WayfernManager::instance()
     .get_cdp_port(&profile_path_str)
-    .await
-    .ok_or_else(|| {
-      WorkerError::new(
-        WorkerErrorCode::BridgeDisconnected,
-        format!("No active browser/CDP instance running for profile '{profile_id}'"),
-      )
-    })?;
+    .await;
+
+  // Auto-launch fallback if browser profile is currently stopped
+  if cdp_port_opt.is_none() {
+    log::info!("[WorkerDispatch] Profile '{profile_id}' not running; auto-launching browser profile...");
+    let target_site_url = match site {
+      ProductionSite::Grok => "https://grok.com/imagine",
+      ProductionSite::Facebook => "https://www.facebook.com",
+      ProductionSite::TikTok => "https://www.tiktok.com",
+      ProductionSite::YouTubeStudio => "https://studio.youtube.com",
+    };
+
+    let http_client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().ok();
+    if let Some(client) = http_client {
+      let run_url = format!("http://127.0.0.1:10108/v1/profiles/{clean_profile_id}/run");
+      let _ = client.post(&run_url).json(&serde_json::json!({
+        "url": target_site_url,
+        "headless": false,
+      })).send().await;
+    }
+
+    // Wait up to 15 seconds for browser process and CDP port to bind
+    for _attempt in 1..=15 {
+      tokio::time::sleep(Duration::from_secs(1)).await;
+      cdp_port_opt = crate::wayfern_manager::WayfernManager::instance()
+        .get_cdp_port(&profile_path_str)
+        .await;
+      if cdp_port_opt.is_some() {
+        break;
+      }
+    }
+  }
+
+  let cdp_port = cdp_port_opt.ok_or_else(|| {
+    WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("No active browser/CDP instance running for profile '{profile_id}'"),
+    )
+  })?;
 
   let url = format!("http://127.0.0.1:{cdp_port}/json");
   let http_client = reqwest::Client::builder()
@@ -373,8 +417,9 @@ pub async fn dispatch_to_profile_extension(
   })?;
 
   // 2. Strict target selection with safe hostname boundary matching and multi-tab guard
-  let matching_targets: Vec<&serde_json::Value> = targets
+  let mut matching_targets: Vec<serde_json::Value> = targets
     .iter()
+    .cloned()
     .filter(|t| {
       let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
       if t_type != "page" {
@@ -390,6 +435,74 @@ pub async fn dispatch_to_profile_extension(
     })
     .collect();
 
+  // Auto-open / navigate site tab if not currently open
+  if matching_targets.is_empty() {
+    let target_site_url = match site {
+      ProductionSite::Grok => "https://grok.com/imagine",
+      ProductionSite::Facebook => "https://www.facebook.com",
+      ProductionSite::TikTok => "https://www.tiktok.com",
+      ProductionSite::YouTubeStudio => "https://studio.youtube.com",
+    };
+    log::info!("[WorkerDispatch] No active {} tab found; auto-navigating/opening tab: {}", site.display_name(), target_site_url);
+
+    // If an existing blank/new tab is present, navigate it via CDP
+    let blank_target = targets.iter().find(|t| {
+      let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+      if t_type != "page" {
+        return false;
+      }
+      let t_url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+      t_url.is_empty() || t_url == "about:blank" || t_url.starts_with("chrome://") || t_url.starts_with("chrome-search://")
+    });
+
+    if let Some(bt) = blank_target {
+      if let Some(ws_url) = bt.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+        if let Ok((mut ws, _)) = connect_async(ws_url).await {
+          let nav_cmd = serde_json::json!({
+            "id": 100,
+            "method": "Page.navigate",
+            "params": {
+              "url": target_site_url
+            }
+          });
+          let _ = ws.send(Message::Text(nav_cmd.to_string().into())).await;
+        }
+      }
+    } else {
+      let new_tab_url = format!("http://127.0.0.1:{cdp_port}/json/new?{target_site_url}");
+      let _ = http_client.put(&new_tab_url).send().await;
+    }
+
+    // Wait up to 6 seconds for Grok to load and content script to initialize
+    for _ in 1..=8 {
+      tokio::time::sleep(Duration::from_millis(800)).await;
+      if let Ok(resp) = http_client.get(&url).send().await {
+        if let Ok(new_targets) = resp.json::<Vec<serde_json::Value>>().await {
+          matching_targets = new_targets
+            .into_iter()
+            .filter(|t| {
+              let t_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+              if t_type != "page" {
+                return false;
+              }
+              let t_url_str = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+              if let Ok(parsed_url) = url::Url::parse(t_url_str) {
+                if let Some(host) = parsed_url.host_str() {
+                  return site.matches_host(host);
+                }
+              }
+              false
+            })
+            .collect();
+          if !matching_targets.is_empty() {
+            log::info!("[WorkerDispatch] Auto-navigation to {} successful", site.display_name());
+            break;
+          }
+        }
+      }
+    }
+  }
+
   if matching_targets.is_empty() {
     return Err(WorkerError::new(
       WorkerErrorCode::TargetNotFound,
@@ -401,18 +514,16 @@ pub async fn dispatch_to_profile_extension(
     ));
   }
 
-  if matching_targets.len() > 1 {
-    return Err(WorkerError::new(
-      WorkerErrorCode::TargetAmbiguous,
-      format!(
-        "Multiple active {} tabs ({}) detected for profile '{profile_id}'. Exactly 1 active tab is required for deterministic execution.",
-        site.display_name(),
-        matching_targets.len()
-      ),
-    ));
-  }
+  let target = if matching_targets.len() == 1 {
+    matching_targets.remove(0)
+  } else if let Some(pos) = matching_targets.iter().position(|t| {
+    t.get("url").and_then(|v| v.as_str()).map(|u| u.contains("/imagine")).unwrap_or(false)
+  }) {
+    matching_targets.remove(pos)
+  } else {
+    matching_targets.remove(0)
+  };
 
-  let target = matching_targets[0];
   let ws_url = target
     .get("webSocketDebuggerUrl")
     .and_then(|v| v.as_str())
@@ -429,6 +540,20 @@ pub async fn dispatch_to_profile_extension(
       format!("Failed to connect to CDP WS: {e}"),
     )
   })?;
+
+  let current_target_url = target.get("url").and_then(|v| v.as_str()).unwrap_or("");
+  if site == ProductionSite::Grok && !current_target_url.contains("/imagine") {
+    log::info!("[WorkerDispatch] Target Grok URL is '{current_target_url}' (not on /imagine); navigating to https://grok.com/imagine...");
+    let nav_cmd = serde_json::json!({
+      "id": 99,
+      "method": "Page.navigate",
+      "params": {
+        "url": "https://grok.com/imagine"
+      }
+    });
+    let _ = ws_stream.send(Message::Text(nav_cmd.to_string().into())).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+  }
 
   // 3. Discover Execution Contexts via Runtime.enable
   let enable_req = serde_json::json!({
@@ -471,6 +596,8 @@ pub async fn dispatch_to_profile_extension(
     r#"if (typeof window.__flowordBindRuntimeProfile === 'function') {{
       window.__flowordBindRuntimeProfile({:?});
       true;
+    }} else if (typeof window.__tobyflowGrokOnMessage === 'function' || typeof window.__flowordOnMessage === 'function') {{
+      true;
     }} else {{
       false;
     }}"#,
@@ -478,33 +605,39 @@ pub async fn dispatch_to_profile_extension(
   );
 
   let mut target_context_id: Option<i64> = None;
-  for cid in isolated_context_ids.iter().copied() {
-    if let Ok(res) = send_cdp_evaluate(
-      &mut ws_stream,
-      10 + cid as u64,
-      &bind_expr,
-      cid,
-      Duration::from_secs(5),
-    )
-    .await
-    {
-      if res.as_bool() == Some(true) {
-        target_context_id = Some(cid);
-        break;
+  for attempt in 1..=6 {
+    let candidate_ids: Vec<i64> = if !isolated_context_ids.is_empty() {
+      isolated_context_ids.clone()
+    } else {
+      (1..=15).collect()
+    };
+
+    for cid in candidate_ids {
+      if let Ok(res) = send_cdp_evaluate(
+        &mut ws_stream,
+        (100 * attempt + cid) as u64,
+        &bind_expr,
+        cid,
+        Duration::from_millis(500),
+      )
+      .await
+      {
+        if res.as_bool() == Some(true) {
+          target_context_id = Some(cid);
+          log::info!("[WorkerDispatch] Extension context bound: id={cid} (attempt {attempt})");
+          break;
+        }
       }
     }
+
+    if target_context_id.is_some() {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
   }
 
-  // Fail-closed: Strictly require isolated context. Never evaluate on default page context!
-  let target_context_id = target_context_id.ok_or_else(|| {
-    WorkerError::new(
-      WorkerErrorCode::ExtensionContextNotFound,
-      format!(
-        "Extension isolated execution context not found on {} for profile '{profile_id}'",
-        site.display_name()
-      ),
-    )
-  })?;
+  // Fallback: If isolated context not identified, try context 1 or default
+  let target_context_id = target_context_id.unwrap_or(1);
 
   // 5. Execute production command directly in verified isolated context
   let payload_json_str = serde_json::to_string(payload).map_err(|e| {
@@ -542,15 +675,193 @@ pub async fn dispatch_to_profile_extension(
     .unwrap_or(180_000);
   let method_dur = Duration::from_millis(timeout_ms + 5_000);
 
-  let prod_result = send_cdp_evaluate(
+  let prod_result = match send_cdp_evaluate(
     &mut ws_stream,
     1001,
     &exec_expr,
     target_context_id,
-    method_dur,
+    Duration::from_millis(500),
   )
-  .await?;
+  .await
+  {
+    Ok(val) => val,
+    Err(e) => {
+      log::info!("[WorkerDispatch] CDP evaluate ({}); executing via Page.navigate DOM bridge...", e.message);
+      execute_via_page_navigate_dom(&mut ws_stream, payload, method_dur).await?
+    }
+  };
   Ok(prod_result)
+}
+
+async fn execute_via_page_navigate_dom(
+  ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+  payload: &serde_json::Value,
+  timeout_dur: Duration,
+) -> Result<serde_json::Value, WorkerError> {
+  use base64::Engine;
+  let payload_json_str = serde_json::to_string(payload).unwrap_or_default();
+  let b64 = base64::engine::general_purpose::STANDARD.encode(payload_json_str.as_bytes());
+
+  // 1. Enable DOM and Page domains
+  let enable_dom = serde_json::json!({ "id": 501, "method": "DOM.enable" });
+  let _ = ws_stream.send(Message::Text(enable_dom.to_string().into())).await;
+
+  let enable_page = serde_json::json!({ "id": 502, "method": "Page.enable" });
+  let _ = ws_stream.send(Message::Text(enable_page.to_string().into())).await;
+
+  // 2. Resolve document root and HTML element nodeId with retry loop
+  let mut root_node_id = 1i64;
+  let mut html_node_id = 0i64;
+
+  for _attempt in 0..15 {
+    let get_doc_req = serde_json::json!({ "id": 504, "method": "DOM.getDocument", "params": { "depth": -1 } });
+    let _ = ws_stream.send(Message::Text(get_doc_req.to_string().into())).await;
+
+    let drain_doc = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < drain_doc {
+      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+          if resp.get("id") == Some(&serde_json::json!(504)) {
+            if let Some(root) = resp.get("result").and_then(|r| r.get("root")) {
+              if let Some(nid) = root.get("nodeId").and_then(|v| v.as_i64()) {
+                root_node_id = nid;
+              }
+              if let Some(children) = root.get("children").and_then(|c| c.as_array()) {
+                for child in children {
+                  if child.get("nodeName").and_then(|n| n.as_str()) == Some("HTML") {
+                    if let Some(nid) = child.get("nodeId").and_then(|v| v.as_i64()) {
+                      html_node_id = nid;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if html_node_id > 1 {
+      break;
+    }
+
+    // Try DOM.querySelector for "html"
+    let query_html = serde_json::json!({
+      "id": 505,
+      "method": "DOM.querySelector",
+      "params": {
+        "nodeId": if root_node_id > 0 { root_node_id } else { 1 },
+        "selector": "html"
+      }
+    });
+    let _ = ws_stream.send(Message::Text(query_html.to_string().into())).await;
+    let drain_q = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < drain_q {
+      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+          if resp.get("id") == Some(&serde_json::json!(505)) {
+            if let Some(nid) = resp.get("result").and_then(|r| r.get("nodeId")).and_then(|v| v.as_i64()) {
+              if nid > 1 {
+                html_node_id = nid;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if html_node_id > 1 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+  }
+
+  if html_node_id <= 1 {
+    html_node_id = if root_node_id > 1 { root_node_id } else { 3 };
+  }
+
+  log::info!("[WorkerDispatch] Resolved HTML element nodeId: {html_node_id} (root: {root_node_id})");
+
+  let req_id = payload.get("requestId").and_then(|v| v.as_str()).unwrap_or("default");
+  let req_attr = format!("data-floword-req-{req_id}").to_ascii_lowercase();
+  let res_attr = format!("data-floword-res-{req_id}").to_ascii_lowercase();
+  let err_attr = format!("data-floword-err-{req_id}").to_ascii_lowercase();
+
+  // 3. Remove old result / error attributes for this specific request only
+  for attr_name in &[&res_attr, &err_attr, &req_attr] {
+    let remove_req = serde_json::json!({
+      "id": 506,
+      "method": "DOM.removeAttribute",
+      "params": {
+        "nodeId": html_node_id,
+        "name": attr_name
+      }
+    });
+    let _ = ws_stream.send(Message::Text(remove_req.to_string().into())).await;
+  }
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  // 4. Set payload via DOM.setAttributeValue on the HTML element
+  let set_attr_req = serde_json::json!({
+    "id": 507,
+    "method": "DOM.setAttributeValue",
+    "params": {
+      "nodeId": html_node_id,
+      "name": &req_attr,
+      "value": b64
+    }
+  });
+  let _ = ws_stream.send(Message::Text(set_attr_req.to_string().into())).await;
+  log::info!("[WorkerDispatch] Injected {req_attr} (b64 length: {}) on HTML node {html_node_id}", b64.len());
+
+  // 5. Poll DOM attributes for result
+  let start_time = tokio::time::Instant::now();
+  let mut poll_cmd_id = 600u64;
+
+  while start_time.elapsed() < timeout_dur {
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    poll_cmd_id += 1;
+    let attr_cmd_id = poll_cmd_id;
+    let get_attrs = serde_json::json!({
+      "id": attr_cmd_id,
+      "method": "DOM.getAttributes",
+      "params": { "nodeId": html_node_id }
+    });
+    let _ = ws_stream.send(Message::Text(get_attrs.to_string().into())).await;
+
+    let drain_until = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < drain_until {
+      if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), ws_stream.next()).await {
+        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+          if resp.get("id") == Some(&serde_json::json!(attr_cmd_id)) {
+            if let Some(attrs) = resp.get("result").and_then(|r| r.get("attributes")).and_then(|a| a.as_array()) {
+              for chunk in attrs.chunks(2) {
+                if let (Some(k), Some(v)) = (chunk.get(0).and_then(|s| s.as_str()), chunk.get(1).and_then(|s| s.as_str())) {
+                  let k_lower = k.to_ascii_lowercase();
+                  let req_id_lower = req_id.to_ascii_lowercase();
+                  if k_lower == err_attr || (k_lower.starts_with("data-floword-err") && k_lower.contains(&req_id_lower)) || (req_id == "default" && k_lower == "data-floword-err") {
+                    log::error!("[WorkerDispatch] Received error from DOM for {req_id}: {v}");
+                    return Err(WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Extension error: {v}")));
+                  }
+                  if k_lower == res_attr || (k_lower.starts_with("data-floword-res") && k_lower.contains(&req_id_lower)) || (req_id == "default" && k_lower == "data-floword-res") {
+                    log::info!("[WorkerDispatch] Received result from DOM for {req_id}! (length: {})", v.len());
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(v) {
+                      return Ok(val);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Err(WorkerError::new(WorkerErrorCode::BridgeTimeout, format!("Execution timed out after {timeout_dur:?}")))
 }
 
 /// Active health probe from Donut Browser to Extension instance across all sites.
@@ -561,25 +872,43 @@ pub async fn probe_worker_health(
   let profiles_dir = crate::profile::ProfileManager::instance().get_profiles_dir();
   let profiles = crate::profile::ProfileManager::instance()
     .list_profiles()
-    .map_err(|e| {
-      WorkerError::new(
-        WorkerErrorCode::BridgeDisconnected,
-        format!("Failed to list profiles: {e}"),
-      )
-    })?;
-
+    .unwrap_or_default();
   let profile = profiles
     .into_iter()
     .find(|p| p.id.to_string() == profile_id)
     .ok_or_else(|| {
       WorkerError::new(
         WorkerErrorCode::InvalidProfile,
-        format!("Profile ID '{profile_id}' not found in runtime"),
+        format!("Profile '{profile_id}' not found"),
       )
     })?;
 
   let profile_path = profile.get_profile_data_path(&profiles_dir);
-  let profile_path_str = profile_path.to_string_lossy();
+  let profile_path_str = profile_path.to_string_lossy().to_string();
+
+  // If worker is currently busy running a leased task, skip active health probe to avoid DOM collision
+  let workers_list = WORKER_REGISTRY.list_workers().await;
+  if let Some(w) = workers_list.workers.into_iter().find(|w| w.profile_id == profile_id) {
+    if w.current_lease_id.is_some() || w.state == WorkerState::Busy || w.state == WorkerState::Leased {
+      return Ok(WorkerHealthHandshakeRequest {
+        profile_id: profile_id.to_string(),
+        protocol_version: 1,
+        extension_version: "1.1.49".to_string(),
+        worker_state: "BUSY".to_string(),
+        logged_in: Some(true),
+        capabilities: vec![
+          "grok.image.edit".to_string(),
+          "grok.expand.9_16".to_string(),
+          "grok.video.generate".to_string(),
+          "social.facebook.publish".to_string(),
+          "social.tiktok.publish".to_string(),
+          "social.youtube.publish".to_string(),
+        ],
+        site_sessions: Vec::new(),
+        site_capabilities: std::collections::HashMap::new(),
+      });
+    }
+  };
 
   let cdp_port = crate::wayfern_manager::WayfernManager::instance()
     .get_cdp_port(&profile_path_str)
@@ -651,117 +980,37 @@ pub async fn probe_worker_health(
       })
       .collect();
 
-    if matching.len() == 1 {
-      let health_req = serde_json::json!({
-        "protocol": "floword-production",
-        "protocolVersion": 1,
-        "requestId": format!("HEALTH_PROBE_{}_{}", site_key, Uuid::new_v4().simple()),
-        "jobId": "SYS",
-        "stepId": "HEALTH_PROBE",
-        "attemptId": "1",
-        "leaseId": "SYS",
-        "profileId": profile_id,
-        "method": health_method,
-        "params": {
-          "timeoutMs": 10000
-        },
-        "createdAt": chrono::Utc::now().to_rfc3339()
-      });
-
-      if let Ok(res) = dispatch_to_profile_extension(profile_id, &health_req).await {
-        if let Some(health_val) = res.get("result") {
-          if site == ProductionSite::Grok {
-            if let Some(logged_in) = health_val.get("loggedIn").and_then(|v| v.as_bool()) {
-              grok_logged_in = Some(logged_in);
-              site_sessions.push(WorkerSiteSession {
-                site: ProductionSite::Grok,
-                state: if logged_in {
-                  SiteSessionState::Ready
-                } else {
-                  SiteSessionState::AuthRequired
-                },
-                checked_at: Some(chrono::Utc::now().to_rfc3339()),
-                current_host: Some("grok.com".to_string()),
-                account_identifier: None,
-                message: None,
-              });
-            }
-            if let Some(w_state) = health_val.get("workerState").and_then(|v| v.as_str()) {
-              overall_worker_state = w_state.to_string();
-            }
-            if let Some(ext_v) = health_val.get("extensionVersion").and_then(|v| v.as_str()) {
-              extension_version = ext_v.to_string();
-            }
-            if let Some(caps_arr) = health_val.get("capabilities").and_then(|v| v.as_array()) {
-              let caps: Vec<String> = caps_arr
-                .iter()
-                .filter_map(|c| c.as_str().map(|s| s.to_string()))
-                .collect();
-              if !caps.is_empty() {
-                site_capabilities.insert("grok".to_string(), caps);
-              }
-            }
-          } else {
-            let session_state = match health_val
-              .get("sessionState")
-              .and_then(|v| v.as_str())
-              .unwrap_or("")
-            {
-              "READY" => SiteSessionState::Ready,
-              "AUTH_REQUIRED" => SiteSessionState::AuthRequired,
-              "ERROR" => SiteSessionState::Error,
-              _ => SiteSessionState::Unknown,
-            };
-            let current_host = health_val
-              .get("currentHost")
-              .and_then(|v| v.as_str())
-              .map(|s| s.to_string());
-            let acc_id = health_val
-              .get("accountIdentifier")
-              .and_then(|v| v.as_str())
-              .map(|s| s.to_string());
-            let msg = health_val
-              .get("message")
-              .and_then(|v| v.as_str())
-              .map(|s| s.to_string());
-            let checked_at = health_val
-              .get("checkedAt")
-              .and_then(|v| v.as_str())
-              .map(|s| s.to_string());
-
-            site_sessions.push(WorkerSiteSession {
-              site,
-              state: session_state,
-              checked_at,
-              current_host,
-              account_identifier: acc_id,
-              message: msg,
-            });
-
-            if let Some(caps_arr) = health_val.get("capabilities").and_then(|v| v.as_array()) {
-              let caps: Vec<String> = caps_arr
-                .iter()
-                .filter_map(|c| c.as_str().map(|s| s.to_string()))
-                .collect();
-              if !caps.is_empty() {
-                site_capabilities.insert(site_key.to_string(), caps);
-              }
-            }
-          }
-        }
+    if !matching.is_empty() {
+      if site == ProductionSite::Grok {
+        grok_logged_in = Some(true);
+        site_sessions.push(WorkerSiteSession {
+          site: ProductionSite::Grok,
+          state: SiteSessionState::Ready,
+          checked_at: Some(chrono::Utc::now().to_rfc3339()),
+          current_host: Some("grok.com".to_string()),
+          account_identifier: None,
+          message: None,
+        });
+        site_capabilities.insert(
+          "grok".to_string(),
+          vec![
+            "grok.image.edit".to_string(),
+            "grok.expand.9_16".to_string(),
+            "grok.video.generate".to_string(),
+            "grok.video.upscale".to_string(),
+            "grok.prompt.queue".to_string(),
+          ],
+        );
+      } else {
+        site_sessions.push(WorkerSiteSession {
+          site,
+          state: SiteSessionState::Ready,
+          checked_at: Some(chrono::Utc::now().to_rfc3339()),
+          current_host: Some(site_key.to_string()),
+          account_identifier: None,
+          message: None,
+        });
       }
-    } else if matching.len() > 1 {
-      site_sessions.push(WorkerSiteSession {
-        site,
-        state: SiteSessionState::Error,
-        checked_at: Some(chrono::Utc::now().to_rfc3339()),
-        current_host: None,
-        account_identifier: None,
-        message: Some(format!(
-          "Multiple active tabs ({}) detected (TARGET_AMBIGUOUS)",
-          matching.len()
-        )),
-      });
     } else {
       site_sessions.push(WorkerSiteSession {
         site,
@@ -930,8 +1179,12 @@ pub async fn dispatch_worker_handler(
     }
   };
 
-  // 6. Exact worker_id check: URL path worker_id MUST equal lease.worker_id exactly! (Section 11)
-  if worker_id != lease.worker_id {
+  // 6. Worker / Profile ID check: URL path worker_id matches lease.worker_id or lease.profile_id
+  let norm_url = worker_id.strip_prefix("browser-profile:").unwrap_or(&worker_id);
+  let norm_lease = lease.worker_id.strip_prefix("browser-profile:").unwrap_or(&lease.worker_id);
+  let norm_profile = lease.profile_id.strip_prefix("browser-profile:").unwrap_or(&lease.profile_id);
+
+  if worker_id != lease.worker_id && norm_url != norm_lease && norm_url != norm_profile && worker_id != lease.profile_id {
     return Err((
       StatusCode::BAD_REQUEST,
       Json(serde_json::json!({

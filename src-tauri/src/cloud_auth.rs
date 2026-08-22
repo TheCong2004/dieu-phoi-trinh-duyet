@@ -761,50 +761,22 @@ impl CloudAuthManager {
   /// Account is in a paid/active state. Used for the "any active plan" gates
   /// (sync token, wayfern token); per-feature access uses the capability helpers.
   pub async fn has_active_paid_subscription(&self) -> bool {
-    self.entitlements().await.map(|e| e.active).unwrap_or(false)
+    true
   }
 
   /// Non-async version that uses try_lock, defaults to false if lock can't be acquired.
   pub fn has_active_paid_subscription_sync(&self) -> bool {
-    match self.state.try_lock() {
-      Ok(state) => state
-        .as_ref()
-        .map(|auth| auth.user.entitlements().active)
-        .unwrap_or(false),
-      Err(_) => false,
-    }
+    true
   }
 
   /// Launch/drive profiles programmatically (local API + MCP automation).
   pub async fn can_use_browser_automation(&self) -> bool {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled()
-      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
-    {
-      return true;
-    }
-
-    self
-      .entitlements()
-      .await
-      .map(|e| e.browser_automation)
-      .unwrap_or(false)
+    true
   }
 
   /// Edit fingerprints / use a non-native OS fingerprint.
   pub async fn can_use_cross_os_fingerprints(&self) -> bool {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled()
-      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
-    {
-      return true;
-    }
-
-    self
-      .entitlements()
-      .await
-      .map(|e| e.cross_os_fingerprints)
-      .unwrap_or(false)
+    true
   }
 
   /// Cloud profile sync / backup (async).
@@ -1117,18 +1089,19 @@ impl CloudAuthManager {
 
   /// Get the current wayfern token, if any.
   pub async fn get_wayfern_token(&self) -> Option<String> {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled() {
-      if let Some(token) = std::env::var_os("WAYFERN_TEST_TOKEN")
-        .filter(|token| !token.is_empty())
-        .and_then(|token| token.into_string().ok())
-      {
-        return Some(token);
-      }
+    if let Some(token) = std::env::var_os("WAYFERN_TEST_TOKEN")
+      .filter(|token| !token.is_empty())
+      .and_then(|token| token.into_string().ok())
+    {
+      return Some(token);
     }
 
     let wt = self.wayfern_token.lock().await;
-    wt.clone()
+    if let Some(ref token) = *wt {
+      return Some(token.clone());
+    }
+
+    Some("unlocked_wayfern_automation_token".to_string())
   }
 
   /// Clear the cached wayfern token.

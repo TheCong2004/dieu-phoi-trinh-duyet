@@ -1596,6 +1596,76 @@ pub fn run() {
   run_with_builder(|builder| builder);
 }
 
+/// Starts the backend-only runtime used by Floword. This deliberately uses a
+/// real Tauri AppHandle because profile/browser managers depend on it, while
+/// omitting every GUI window, tray and frontend plugin.
+pub fn run_headless() {
+  let host = std::env::var("FLOWORD_DONUT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+  if host != "127.0.0.1" {
+    panic!("FLOWORD_DONUT_HOST must remain 127.0.0.1 in the headless runtime");
+  }
+  let port = std::env::var("FLOWORD_DONUT_PORT")
+    .ok()
+    .and_then(|value| value.parse::<u16>().ok())
+    .unwrap_or(10108);
+
+  let builder = tauri::Builder::default()
+    .plugin(tauri_plugin_shell::init())
+    .plugin(tauri_plugin_fs::init())
+    .plugin(tauri_plugin_opener::init())
+    .plugin(
+      tauri_plugin_log::Builder::new()
+        .clear_targets()
+        .target(Target::new(TargetKind::LogDir {
+          file_name: Some(app_dirs::app_name().to_string()),
+        }))
+        .level(log::LevelFilter::Info)
+        .build(),
+    )
+    .setup(move |app| {
+      bundled_extensions::ensure_unpacked(app.handle());
+      let app_handle = app.handle().clone();
+      tauri::async_runtime::spawn(async move {
+        crate::worker::WORKER_REGISTRY.load_from_storage().await;
+        let startup_profiles = crate::profile::ProfileManager::instance()
+          .list_profiles()
+          .ok();
+        if let Some(profiles) = startup_profiles {
+          crate::worker::WORKER_REGISTRY
+            .sync_startup_profiles(&profiles)
+            .await;
+        }
+
+        match crate::api_server::start_api_server_internal_strict(port, &app_handle).await {
+          Ok(actual_port) => log::info!(
+            "Floword Donut API bound on {host}:{actual_port} (parent_pid={:?})",
+            std::env::var("FLOWORD_PARENT_PID").ok()
+          ),
+          Err(error) => {
+            log::error!("Floword Donut runtime failed to bind {host}:{port}: {error}");
+            app_handle.exit(1);
+            return;
+          }
+        }
+        crate::worker::WORKER_REGISTRY.mark_ready().await;
+        log::info!("Floword Donut runtime ready on {host}:{port}");
+      });
+      Ok(())
+    });
+
+  builder
+    .build(tauri::generate_context!())
+    .expect("failed to build Floword Donut runtime")
+    .run(|_app_handle, event| {
+      match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+          api.prevent_exit();
+        }
+        _ => {}
+      }
+    });
+}
+
 #[doc(hidden)]
 pub fn run_with_builder(
   configure_builder: impl FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry>,
@@ -1720,24 +1790,18 @@ pub fn run_with_builder(
         .focused(true)
         .visible(true);
 
-      #[cfg(feature = "e2e")]
-      let win_builder = match e2e_automation_profile_dir() {
-          Some(profile_dir) => win_builder
-            .data_directory(profile_dir.join("webview"))
-            // WKWebView ignores data_directory on macOS. Incognito gives every
-            // launched app process a non-persistent data store there, and also
-            // prevents WebView2/WebKitGTK caches from escaping the session on
-            // the other platforms. Durable app state is still exercised via
-            // DONUTBROWSER_DATA_ROOT; only browser-engine storage is ephemeral.
-            .incognito(true),
-          None => win_builder,
-      };
+      let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+      let webview_data_dir = std::path::PathBuf::from(local_app_data).join("DonutBrowserApp").join("webview_gui");
+      let win_builder = win_builder.data_directory(webview_data_dir);
 
       #[cfg(target_os = "windows")]
       let win_builder = win_builder.decorations(false);
 
       #[allow(unused_variables)]
       let window = win_builder.build().unwrap();
+      let _ = window.show();
+      let _ = window.set_focus();
+      let _ = window.unminimize();
 
       // System tray so the user can keep the app running after the close
       // dialog's "Minimize" action hides the window. Best-effort: a tray

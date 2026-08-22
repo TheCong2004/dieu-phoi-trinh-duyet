@@ -57,10 +57,41 @@ export function CapCutPolotPage() {
   };
 
   useEffect(() => {
+    let isMounted = true;
     if (!autoStartRef.current) {
       autoStartRef.current = true;
-      void startSidecar();
+      (async () => {
+        if (isRunning) return;
+        setIsRunning(true);
+        addLog("Đang kích hoạt CapCutPolot Engine ngầm...", "system");
+
+        try {
+          const child = await launchCapCutPolot({
+            mode: "auto",
+            onStdout: (line) => {
+              if (isMounted) addLog(line, "stdout");
+            },
+            onStderr: (line) => {
+              if (isMounted) addLog(line, "stderr");
+            },
+          });
+
+          if (isMounted) {
+            setChildProcess(child);
+            setPid(child.pid);
+            addLog(`✓ CapCutPolot Engine sẵn sàng (PID: ${child.pid})`, "system");
+          }
+        } catch (err: unknown) {
+          if (isMounted) {
+            addLog(`Lỗi khởi chạy: ${err instanceof Error ? err.message : String(err)}`, "stderr");
+            setIsRunning(false);
+          }
+        }
+      })();
     }
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const stopSidecar = async () => {

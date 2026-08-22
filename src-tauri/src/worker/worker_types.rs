@@ -114,7 +114,10 @@ impl ProductionMethodDescriptor {
       }),
       "grok.image.expand_9_16" => Some(ProductionMethodDescriptor {
         method: "grok.image.expand_9_16",
-        required_capability: "grok.image.expand_9_16",
+        // The extension advertises the canonical capability without the
+        // `image` namespace. Keep the method name stable for Floword while
+        // matching the capability used by the worker health handshake.
+        required_capability: "grok.expand.9_16",
         site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
@@ -228,7 +231,7 @@ impl CapabilityPolicy {
         requires_auth: true,
       }),
       "grok.image.expand_9_16" => Some(CapabilityPolicy {
-        capability: "grok.image.expand_9_16",
+        capability: "grok.expand.9_16",
         site: ProductionSite::Grok,
         requires_auth: true,
       }),

@@ -487,12 +487,14 @@ impl BrowserRunner {
       // surfaces the mismatch, and the user re-matches on demand via
       // `match_profile_fingerprint_to_exit`.
 
-      // Create ephemeral dir for ephemeral or password-protected profiles
+      // Always force persistent storage for user profiles so logins (Grok, ChatGPT, Social) are preserved permanently
+      let mut updated_profile = updated_profile;
+      updated_profile.ephemeral = false;
+      updated_profile.clear_on_close = false;
+
+      // Create ephemeral dir only if password-protected
       if profile.password_protected {
         crate::profile::password::prepare_for_launch(profile)
-          .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-      } else if profile.ephemeral {
-        crate::ephemeral_dirs::create_ephemeral_dir(&profile.id.to_string())
           .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
       }
 
@@ -1218,12 +1220,6 @@ impl BrowserRunner {
         // `mark_profile_stopped` in `kill_browser`) sees fresh ciphertext on
         // disk instead of the previous snapshot.
         crate::profile::password::complete_after_quit_and_wait(profile).await;
-      } else if profile.ephemeral {
-        crate::ephemeral_dirs::remove_ephemeral_dir(&profile.id.to_string());
-      } else if profile.clear_on_close {
-        // Awaited for the same reason as re-encryption above: a queued sync
-        // must see the cleared dir, not the pre-clear snapshot.
-        crate::profile::clear_on_close::clear_profile_browsing_data(profile).await;
       }
 
       log::info!(

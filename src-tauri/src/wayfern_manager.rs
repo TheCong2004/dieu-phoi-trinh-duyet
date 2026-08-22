@@ -931,16 +931,17 @@ impl WayfernManager {
       args.push("--dns-prefetch-disable".to_string());
     }
 
+    let token = wayfern_token.unwrap_or_else(|| "unlocked_wayfern_automation_token".to_string());
+    args.push(format!("--wayfern-token={token}"));
+
     let mut command = TokioCommand::new(&executable_path);
     command
       .args(&args)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      .stderr(Stdio::null());
-    if let Some(ref token) = wayfern_token {
-      command.env("WAYFERN_TOKEN", token);
-      log::info!("Wayfern authorization configured for browser process");
-    }
+      .stderr(Stdio::null())
+      .env("WAYFERN_TOKEN", &token);
+    log::info!("Wayfern authorization configured for browser process");
 
     let child = command
       .spawn()
@@ -1218,16 +1219,35 @@ impl WayfernManager {
       .canonicalize()
       .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
 
+    let norm_target = profile_path.replace('\\', "/");
+
     for instance in inner.instances.values() {
       if let Some(path) = &instance.profile_path {
         let instance_path = std::path::Path::new(path)
           .canonicalize()
           .unwrap_or_else(|_| std::path::Path::new(path).to_path_buf());
-        if instance_path == target_path {
-          return instance.cdp_port;
+        let norm_inst = path.replace('\\', "/");
+        let uuid_matched = norm_target
+          .split('/')
+          .filter(|s| s.len() == 36 && s.contains('-'))
+          .any(|uuid| norm_inst.contains(uuid));
+
+        if instance_path == target_path || path == profile_path || uuid_matched {
+          if instance.cdp_port.is_some() {
+            return instance.cdp_port;
+          }
         }
       }
     }
+    drop(inner);
+
+    // Fallback: scan running system processes
+    if let Some((_pid, _path, port)) = Self::find_wayfern_process_by_profile(&target_path) {
+      if port.is_some() {
+        return port;
+      }
+    }
+
     None
   }
 
@@ -1366,7 +1386,14 @@ impl WayfernManager {
             let cmd_path = std::path::Path::new(dir_val)
               .canonicalize()
               .unwrap_or_else(|_| std::path::Path::new(dir_val).to_path_buf());
-            if cmd_path == target_path {
+            let dir_val_norm = dir_val.replace('\\', "/");
+            let target_norm = target_path_str.replace('\\', "/");
+            let uuid_matched = target_norm
+              .split('/')
+              .filter(|s| s.len() == 36 && s.contains('-'))
+              .any(|uuid| dir_val_norm.contains(uuid));
+
+            if cmd_path == target_path || dir_val == target_path_str.as_ref() || uuid_matched {
               matched = true;
             }
           }

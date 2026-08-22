@@ -13,7 +13,7 @@ default-run = "donutbrowser"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "donutbrowser_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["lib"]
 doctest = false
 
 [[bin]]
@@ -23,6 +23,10 @@ path = "src/main.rs"
 [[bin]]
 name = "donut-proxy"
 path = "src/bin/proxy_server.rs"
+
+[[bin]]
+name = "floword-donut-runtime"
+path = "src/bin/floword_donut_runtime.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

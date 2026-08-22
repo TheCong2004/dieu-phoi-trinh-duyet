@@ -146,6 +146,7 @@ pub struct UpdateProfileRequest {
 #[derive(Clone)]
 struct ApiServerState {
   app_handle: tauri::AppHandle,
+  runtime_kind: &'static str,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -654,6 +655,8 @@ impl ApiServer {
     &mut self,
     app_handle: tauri::AppHandle,
     preferred_port: u16,
+    allow_fallback: bool,
+    runtime_kind: &'static str,
   ) -> Result<u16, String> {
     // Stop existing server if running
     self.stop().await.ok();
@@ -661,12 +664,19 @@ impl ApiServer {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let state = ApiServerState {
       app_handle: app_handle.clone(),
+      runtime_kind,
     };
 
     // Try preferred port first, then random port
     let listener = match TcpListener::bind(format!("127.0.0.1:{preferred_port}")).await {
       Ok(listener) => listener,
       Err(_) => {
+        if !allow_fallback {
+          return Err(crate::backend_error_with_detail(
+            "API_PORT_UNAVAILABLE",
+            format!("127.0.0.1:{preferred_port} is already in use"),
+          ));
+        }
         // Port conflict, try random port
         let random_port = rand::random::<u16>().saturating_add(10000);
         match TcpListener::bind(format!("127.0.0.1:{random_port}")).await {
@@ -742,6 +752,7 @@ impl ApiServer {
     let app = Router::new()
       .merge(v1_routes)
       .merge(crate::worker::worker_routes())
+      .route("/v1/runtime/health", get(runtime_health_handler))
       .route("/openapi.json", get(move || async move { Json(api) }))
       .route(
         "/v1/openapi.json",
@@ -752,6 +763,7 @@ impl ApiServer {
       // and how long it took. Never logs request bodies or auth headers.
       .layer(middleware::from_fn(request_logging_middleware))
       .layer(CorsLayer::permissive())
+      .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024))
       .with_state(state);
 
     // Start server task
@@ -805,6 +817,11 @@ async fn auth_middleware(
   next: Next,
 ) -> Result<Response, StatusCode> {
   let path = request.uri().path().to_string();
+
+  if state.runtime_kind == "floword-donut-runtime" {
+    // Embedded background runtime inside Floword Artcraft - local loopback without external token
+    return Ok(next.run(request).await);
+  }
 
   // Get the Authorization header
   let auth_header = headers
@@ -943,7 +960,38 @@ pub async fn start_api_server_internal(
   app_handle: &tauri::AppHandle,
 ) -> Result<u16, String> {
   let mut server_guard = API_SERVER.lock().await;
-  server_guard.start(app_handle.clone(), port).await
+  server_guard
+    .start(app_handle.clone(), port, true, "donutbrowser")
+    .await
+}
+
+/// Starts the local API without silently moving to another port. Headless
+/// Floword runtime uses this so its supervisor can distinguish ownership from
+/// an unrelated process already listening on the canonical port.
+pub async fn start_api_server_internal_strict(
+  port: u16,
+  app_handle: &tauri::AppHandle,
+) -> Result<u16, String> {
+  let mut server_guard = API_SERVER.lock().await;
+  server_guard
+    .start(app_handle.clone(), port, false, "floword-donut-runtime")
+    .await
+}
+
+async fn runtime_health_handler(
+  State(state): State<ApiServerState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+  if !crate::worker::WORKER_REGISTRY.is_ready().await {
+    return Err(StatusCode::SERVICE_UNAVAILABLE);
+  }
+
+  Ok(Json(serde_json::json!({
+    "status": "READY",
+    "protocol": "floword-production",
+    "protocolVersion": 1,
+    "runtime": state.runtime_kind,
+    "pid": std::process::id(),
+  })))
 }
 
 #[tauri::command]
@@ -2340,9 +2388,10 @@ async fn run_profile(
   State(state): State<ApiServerState>,
   Json(request): Json<RunProfileRequest>,
 ) -> Result<Json<RunProfileResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
+  if state.runtime_kind != "floword-donut-runtime"
+    && !crate::cloud_auth::CLOUD_AUTH
+      .can_use_browser_automation()
+      .await
   {
     return Err(StatusCode::PAYMENT_REQUIRED);
   }
@@ -2369,37 +2418,36 @@ async fn run_profile(
     .await
     .map_err(|_| StatusCode::CONFLICT)?;
 
-  let remote_debugging_port = {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-      .await
-      .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let port = listener
-      .local_addr()
-      .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-      .port();
-    drop(listener);
-    port
-  };
-
-  // Use the same launch path as the main app, but force a fresh instance with
-  // remote debugging enabled so the returned port is the one the browser binds.
-  match crate::browser_runner::launch_browser_profile_impl(
+  let cdp_port = match crate::browser_runner::launch_browser_profile_impl(
     state.app_handle.clone(),
     profile.clone(),
     url,
-    Some(remote_debugging_port),
+    None,
     headless,
-    true,
+    false,
   )
   .await
   {
-    Ok(updated_profile) => Ok(Json(RunProfileResponse {
-      profile_id: updated_profile.id.to_string(),
-      remote_debugging_port,
-      headless,
-    })),
-    Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-  }
+    Ok(updated_profile) => {
+      let profiles_dir = ProfileManager::instance().get_profiles_dir();
+      let profile_path = updated_profile.get_profile_data_path(&profiles_dir);
+      let profile_path_str = profile_path.to_string_lossy();
+      crate::wayfern_manager::WayfernManager::instance()
+        .get_cdp_port(&profile_path_str)
+        .await
+        .unwrap_or(0)
+    }
+    Err(e) => {
+      log::error!("Run profile failed: {e}");
+      return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+  };
+
+  Ok(Json(RunProfileResponse {
+    profile_id: profile.id.to_string(),
+    remote_debugging_port: cdp_port,
+    headless,
+  }))
 }
 
 // API Handler - Launch this profile on a REMOTE VM of its own operating system

@@ -97,14 +97,20 @@ function ensureCapCutPolotBinary(target) {
     : "d:/capcutpolot/artcraft/target/release/artcraft";
 
   if (existsSync(artcraftSource)) {
-    copyFileSync(artcraftSource, dest);
-    console.log(`Copied artcraft binary to ${dest}`);
+    try {
+      copyFileSync(artcraftSource, dest);
+      console.log(`Copied artcraft binary to ${dest}`);
+    } catch (e) {
+      console.log(`Using existing binary at ${dest}`);
+    }
   } else if (!existsSync(dest)) {
     // If not built yet, copy donut-proxy binary as a placeholder so Tauri dev builds succeed
     const donutProxySource = join(destDir, isWindows ? `donut-proxy-${target}.exe` : `donut-proxy-${target}`);
     if (existsSync(donutProxySource)) {
-      copyFileSync(donutProxySource, dest);
-      console.log(`Created sidecar placeholder for capcutpolot at ${dest}`);
+      try {
+        copyFileSync(donutProxySource, dest);
+        console.log(`Created sidecar placeholder for capcutpolot at ${dest}`);
+      } catch (e) {}
     }
   }
 }

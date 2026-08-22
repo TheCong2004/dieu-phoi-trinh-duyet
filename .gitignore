@@ -74,3 +74,9 @@ nodecar/nodecar-bin
 # claude
 .claude/
 node_modules
+
+# Floword runtime logs and test artifacts
+*.log
+src-tauri/floword-runtime-test.*
+src-tauri/bundled-extensions/
+src-tauri/resources/
