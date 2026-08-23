@@ -158,6 +158,16 @@ async fn ensure_playwright_worker(
     ));
   }
   let logged_in = health.get("loggedIn").and_then(|v| v.as_bool());
+  let status = health
+    .get("status")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_ascii_uppercase();
+  let worker_state = health
+    .get("workerState")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_ascii_uppercase();
   let extension_version = health
     .get("extensionVersion")
     .and_then(|v| v.as_str())
@@ -175,23 +185,40 @@ async fn ensure_playwright_worker(
         .collect()
     })
     .unwrap_or_default();
-  if protocol_version != Some(1) || extension_version.is_none() {
+  if protocol_version != Some(1)
+    || extension_version.is_none()
+    || status.is_empty()
+    || worker_state.is_empty()
+  {
     return Err(WorkerError::new(
       WorkerErrorCode::ProtocolMismatch,
       "Playwright extension health is not ready",
     ));
   }
+  let state = if logged_in == Some(false) || status == "LOGIN_REQUIRED" {
+    WorkerState::LoginRequired
+  } else if status == "BUSY" || worker_state == "BUSY" {
+    WorkerState::Busy
+  } else if status == "LEASED" || worker_state == "LEASED" {
+    WorkerState::Leased
+  } else if status == "RECONCILING" || worker_state == "RECONCILING" {
+    WorkerState::Reconciling
+  } else if status == "READY" && (worker_state == "IDLE" || worker_state == "READY") {
+    WorkerState::Ready
+  } else {
+    return Err(WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      format!("Contradictory Playwright health state: status={status} workerState={worker_state}"),
+    ));
+  };
+  let auth_required = state == WorkerState::LoginRequired;
   let worker = BrowserWorker {
     worker_id: format!("playwright-profile:{profile_id}"),
     profile_id: profile_id.to_string(),
     provider: WorkerProvider::Playwright,
     pool_id: req.pool_id.clone(),
-    state: if logged_in == Some(false) {
-      WorkerState::LoginRequired
-    } else {
-      WorkerState::Ready
-    },
-    capabilities: if logged_in == Some(false) {
+    state,
+    capabilities: if logged_in == Some(false) || auth_required {
       vec![]
     } else {
       capabilities
