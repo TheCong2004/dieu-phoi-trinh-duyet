@@ -104,6 +104,14 @@ impl WorkerRegistry {
       }
     }
 
+    let mut worker = worker;
+    if let Some(existing) = state.workers.get(&worker.worker_id) {
+      if existing.current_lease_id.is_some() {
+        worker.current_lease_id = existing.current_lease_id.clone();
+        worker.current_job_id = existing.current_job_id.clone();
+        worker.state = existing.state.clone();
+      }
+    }
     state.workers.insert(worker.worker_id.clone(), worker);
     Ok(())
   }

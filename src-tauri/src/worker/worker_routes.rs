@@ -1256,7 +1256,9 @@ pub async fn dispatch_worker_handler(
   // Playwright worker never reaches the legacy Wayfern/CDP path.
   let dispatch_result = match worker.provider() {
     WorkerProvider::Playwright => dispatch_to_playwright_provider(profile_id, &payload).await,
-    WorkerProvider::Wayfern => dispatch_to_profile_extension(profile_id, &payload).await,
+    WorkerProvider::Wayfern => dispatch_to_profile_extension(profile_id, &payload)
+      .await
+      .map_err(map_legacy_dispatch_error),
   };
   match dispatch_result {
     Ok(result) => {
@@ -1370,3 +1372,8 @@ async fn dispatch_to_playwright_provider(profile_id: &str, payload: &serde_json:
 }
 
 fn provider_error(code: &str, message: String, status: StatusCode) -> (StatusCode, Json<serde_json::Value>) { (status, Json(serde_json::json!({"error":{"code":code,"message":message,"retryable":status.is_server_error()}}))) }
+
+fn map_legacy_dispatch_error(error: WorkerError) -> (StatusCode, Json<serde_json::Value>) {
+  let status = StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+  provider_error(error.code_str(), error.message, status)
+}
