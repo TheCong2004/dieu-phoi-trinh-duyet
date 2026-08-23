@@ -633,7 +633,11 @@ impl WorkerRegistry {
       let target_worker = state
         .workers
         .values()
-        .find(|w| &w.profile_id == pid || &w.worker_id == pid)
+        .find(|w| {
+          (&w.profile_id == pid || &w.worker_id == pid)
+            && (std::env::var_os("FLOWORD_PLAYWRIGHT_RUNTIME_URL").is_none()
+              || w.provider() == crate::worker::worker_types::WorkerProvider::Playwright)
+        })
         .cloned();
 
       match target_worker {
@@ -653,7 +657,11 @@ impl WorkerRegistry {
       let eligible = state
         .workers
         .values()
-        .find(|w| Self::evaluate_worker_eligibility(w, &req).is_ok())
+        .find(|w| {
+          (std::env::var_os("FLOWORD_PLAYWRIGHT_RUNTIME_URL").is_none()
+            || w.provider() == crate::worker::worker_types::WorkerProvider::Playwright)
+            && Self::evaluate_worker_eligibility(w, &req).is_ok()
+        })
         .map(|w| w.worker_id.clone());
 
       match eligible {

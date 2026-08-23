@@ -32,6 +32,19 @@ pub enum WorkerState {
   Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerProvider {
+  Playwright,
+  Wayfern,
+}
+
+impl Default for WorkerProvider {
+  fn default() -> Self {
+    Self::Wayfern
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LeaseStatus {
@@ -445,6 +458,16 @@ pub struct BrowserWorker {
   pub current_job_id: Option<String>,
   pub last_heartbeat_at: Option<String>,
   pub last_error: Option<String>,
+}
+
+impl BrowserWorker {
+  pub fn provider(&self) -> WorkerProvider {
+    if self.worker_id.starts_with("playwright-profile:") {
+      WorkerProvider::Playwright
+    } else {
+      WorkerProvider::Wayfern
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
