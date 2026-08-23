@@ -203,8 +203,15 @@ async fn ensure_playwright_worker(
     WorkerState::Leased
   } else if status == "RECONCILING" || worker_state == "RECONCILING" {
     WorkerState::Reconciling
-  } else if status == "READY" && (worker_state == "IDLE" || worker_state == "READY") {
+  } else if status == "READY" && worker_state == "IDLE" && logged_in == Some(true) {
     WorkerState::Ready
+  } else if status == "READY" && worker_state == "IDLE" && logged_in.is_none() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      "Playwright health READY/IDLE response omitted loggedIn",
+    ));
+  } else if status == "READY" && worker_state == "IDLE" {
+    WorkerState::LoginRequired
   } else {
     return Err(WorkerError::new(
       WorkerErrorCode::InvalidHealthResponse,
