@@ -126,7 +126,10 @@ async fn ensure_playwright_worker(
     .unwrap_or_else(|_| "http://127.0.0.1:10108".to_string());
   let run = client
     .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
-    .json(&serde_json::json!({ "url": "https://grok.com/imagine", "headless": false }))
+    // Do not pass a URL here: /run opens a new tab when a profile is already
+    // running. Donut owns tab selection; the sidecar only attaches to the
+    // existing managed Grok tab over CDP.
+    .json(&serde_json::json!({ "headless": false }))
     .send()
     .await
     .map_err(|e| {
@@ -160,8 +163,9 @@ async fn ensure_playwright_worker(
   let start = client
     .post(format!("{base}/v1/profiles/{profile_id}/start"))
     .json(&serde_json::json!({
-      "url": "https://grok.com/imagine",
-      "cdpEndpoint": format!("http://127.0.0.1:{cdp_port}")
+      "cdpEndpoint": format!("http://127.0.0.1:{cdp_port}"),
+      "browserPid": run_body.get("browser_pid").and_then(|v| v.as_u64()),
+      "launchGeneration": run_body.get("launch_generation").and_then(|v| v.as_u64())
     }))
     .send()
     .await

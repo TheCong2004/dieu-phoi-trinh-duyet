@@ -329,6 +329,10 @@ struct RunProfileResponse {
   profile_id: String,
   remote_debugging_port: u16,
   headless: bool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  browser_pid: Option<u32>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  launch_generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2432,7 +2436,7 @@ async fn run_profile(
     .await
     .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
 
-  let cdp_port = match crate::browser_runner::launch_browser_profile_impl(
+  let updated_profile = match crate::browser_runner::launch_browser_profile_impl(
     state.app_handle.clone(),
     profile.clone(),
     url,
@@ -2442,25 +2446,26 @@ async fn run_profile(
   )
   .await
   {
-    Ok(updated_profile) => {
-      let profiles_dir = ProfileManager::instance().get_profiles_dir();
-      let profile_path = updated_profile.get_profile_data_path(&profiles_dir);
-      let profile_path_str = profile_path.to_string_lossy();
-      crate::wayfern_manager::WayfernManager::instance()
-        .get_cdp_port(&profile_path_str)
-        .await
-        .unwrap_or(0)
-    }
+    Ok(updated_profile) => updated_profile,
     Err(e) => {
       log::error!("Run profile failed: {e}");
       return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
     }
   };
+  let profiles_dir = ProfileManager::instance().get_profiles_dir();
+  let profile_path = updated_profile.get_profile_data_path(&profiles_dir);
+  let profile_path_str = profile_path.to_string_lossy();
+  let cdp_port = crate::wayfern_manager::WayfernManager::instance()
+    .get_cdp_port(&profile_path_str)
+    .await
+    .unwrap_or(0);
 
   Ok(Json(RunProfileResponse {
     profile_id: profile.id.to_string(),
     remote_debugging_port: cdp_port,
     headless,
+    browser_pid: updated_profile.process_id,
+    launch_generation: updated_profile.last_launch,
   }))
 }
 
