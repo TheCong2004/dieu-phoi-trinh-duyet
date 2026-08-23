@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
   Router::new()
     .route("/v1/workers/acquire", post(acquire_worker_handler))
+    .route("/v1/workers/register", post(register_worker_handler))
     .route(
       "/v1/workers/leases/{lease_id}/heartbeat",
       post(heartbeat_lease_handler),
@@ -69,6 +70,20 @@ pub async fn acquire_worker_handler(
           }
         })),
       ))
+    }
+  }
+}
+
+/// Registers workers owned by an external runtime provider (for example the
+/// Floword Playwright sidecar). The registry remains the sole lease authority.
+pub async fn register_worker_handler(
+  Json(payload): Json<BrowserWorker>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+  match WORKER_REGISTRY.register_or_update_worker(payload.clone()).await {
+    Ok(()) => Ok(Json(serde_json::json!({ "worker_id": payload.worker_id, "profile_id": payload.profile_id, "status": "REGISTERED" }))),
+    Err(err) => {
+      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      Err((status, Json(serde_json::json!({ "error": { "code": err.code_str(), "message": err.message } }))))
     }
   }
 }
