@@ -124,44 +124,12 @@ async fn ensure_playwright_worker(
   // Playwright sidecar. The sidecar must never launch a second browser.
   let donut_base = std::env::var("FLOWORD_DONUT_BROWSER_API_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:10108".to_string());
-  let profiles: serde_json::Value = client
-    .get(format!("{donut_base}/v1/profiles"))
-    .send()
-    .await
-    .map_err(|e| {
-      WorkerError::new(
-        WorkerErrorCode::BridgeDisconnected,
-        format!("Donut profile catalog unavailable: {e}"),
-      )
-    })?
-    .json()
-    .await
-    .map_err(|e| {
-      WorkerError::new(
-        WorkerErrorCode::InvalidHealthResponse,
-        format!("Invalid Donut profile catalog: {e}"),
-      )
-    })?;
-  let already_running = profiles
-    .get("profiles")
-    .and_then(|v| v.as_array())
-    .and_then(|items| {
-      items
-        .iter()
-        .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(profile_id))
-    })
-    .and_then(|item| item.get("is_running").and_then(|v| v.as_bool()))
-    .unwrap_or(false);
-  let run_body = if already_running {
-    serde_json::json!({ "headless": false })
-  } else {
-    serde_json::json!({ "url": "https://grok.com/imagine", "headless": false })
-  };
+  // Donut atomically decides whether the persisted browser PID is alive. It
+  // opens Grok only on a cold start and ignores the URL when reusing a live
+  // profile, avoiding the catalog/run race and duplicate tabs.
+  let run_body = serde_json::json!({ "url": "https://grok.com/imagine", "headless": false });
   let run = client
     .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
-    // Do not pass a URL here: /run opens a new tab when a profile is already
-    // running. Donut owns tab selection; the sidecar only attaches to the
-    // existing managed Grok tab over CDP.
     .json(&run_body)
     .send()
     .await
@@ -193,12 +161,30 @@ async fn ensure_playwright_worker(
         "Donut run response omitted remote_debugging_port",
       )
     })?;
+  let browser_pid = run_body
+    .get("browser_pid")
+    .and_then(|v| v.as_u64())
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Donut run response omitted browser_pid",
+      )
+    })?;
+  let launch_generation = run_body
+    .get("launch_generation")
+    .and_then(|v| v.as_u64())
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Donut run response omitted launch_generation",
+      )
+    })?;
   let start = client
     .post(format!("{base}/v1/profiles/{profile_id}/start"))
     .json(&serde_json::json!({
       "cdpEndpoint": format!("http://127.0.0.1:{cdp_port}"),
-      "browserPid": run_body.get("browser_pid").and_then(|v| v.as_u64()),
-      "launchGeneration": run_body.get("launch_generation").and_then(|v| v.as_u64())
+      "browserPid": browser_pid,
+      "launchGeneration": launch_generation
     }))
     .send()
     .await

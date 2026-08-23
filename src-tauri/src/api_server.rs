@@ -2411,24 +2411,44 @@ async fn run_profile(
       .can_use_browser_automation()
       .await
   {
-    return Err((StatusCode::PAYMENT_REQUIRED, "browser automation is not available for this account".to_string()));
+    return Err((
+      StatusCode::PAYMENT_REQUIRED,
+      "browser automation is not available for this account".to_string(),
+    ));
   }
 
   let headless = request.headless.unwrap_or(false);
-  let url = request.url;
 
   let profile_manager = ProfileManager::instance();
-  let profiles = profile_manager
-    .list_profiles()
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list profiles: {error}")))?;
+  let profiles = profile_manager.list_profiles().map_err(|error| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("failed to list profiles: {error}"),
+    )
+  })?;
 
   let profile = profiles
     .iter()
     .find(|p| p.id.to_string() == id)
     .ok_or((StatusCode::NOT_FOUND, "profile not found".to_string()))?;
 
+  // A persisted PID is not proof that the browser is alive. Reuse the
+  // existing browser only when the process table confirms it; otherwise this
+  // is a cold start and the requested URL is passed exactly once.
+  let browser_alive = profile
+    .process_id
+    .map(|pid| {
+      use sysinfo::{Pid, System};
+      System::new_all().process(Pid::from(pid as usize)).is_some()
+    })
+    .unwrap_or(false);
+  let url = if browser_alive { None } else { request.url };
+
   if profile.is_cross_os() {
-    return Err((StatusCode::BAD_REQUEST, "profile was created on a different operating system".to_string()));
+    return Err((
+      StatusCode::BAD_REQUEST,
+      "profile was created on a different operating system".to_string(),
+    ));
   }
 
   // Team lock check
