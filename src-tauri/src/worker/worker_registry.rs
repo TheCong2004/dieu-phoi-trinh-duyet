@@ -487,6 +487,21 @@ impl WorkerRegistry {
       ));
     }
 
+    // Production leases are only granted to a fully reconciled READY worker.
+    // In particular, RECONCILING must remain quarantined until a health probe
+    // explicitly transitions it back to READY.
+    if worker.state != WorkerState::Ready {
+      let code = match worker.state {
+        WorkerState::Busy | WorkerState::Leased => WorkerErrorCode::WorkerBusy,
+        WorkerState::Reconciling => WorkerErrorCode::WorkerReconciling,
+        _ => WorkerErrorCode::ExtensionUnavailable,
+      };
+      return Err(WorkerError::new(
+        code,
+        format!("Worker is not READY (state={:?})", worker.state),
+      ));
+    }
+
     // 3. Bring offline workers through the auto-launch path before checking
     // capabilities. A newly-created worker intentionally starts with an empty
     // capability list; treat it as extension-unavailable until the health

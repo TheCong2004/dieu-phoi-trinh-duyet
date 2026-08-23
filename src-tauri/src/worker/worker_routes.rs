@@ -8,6 +8,7 @@ use axum::{
   Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -97,15 +98,26 @@ fn error_response(
   )
 }
 
+fn playwright_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+  let mut headers = HeaderMap::new();
+  if let Ok(token) = std::env::var("FLOWORD_SIDECAR_TOKEN") {
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+      headers.insert(AUTHORIZATION, value);
+    }
+  }
+  reqwest::Client::builder()
+    .timeout(timeout)
+    .default_headers(headers)
+    .build()
+}
+
 async fn ensure_playwright_worker(
   profile_id: &str,
   req: &AcquireWorkerRequest,
 ) -> Result<(), super::worker_types::WorkerError> {
   let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
-  let client = reqwest::Client::builder()
-    .timeout(Duration::from_secs(30))
-    .build()
+  let client = playwright_http_client(Duration::from_secs(30))
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
   let start = client.post(format!("{base}/v1/profiles/{profile_id}/start")).json(&serde_json::json!({ "url": "https://grok.com/imagine", "extensionPath": std::env::var("FLOWORD_CHROMEX_EXTENSION_PATH").ok() })).send().await.map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Playwright runtime unavailable: {e}")))?;
   if !start.status().is_success() {
@@ -1554,7 +1566,9 @@ pub async fn cancel_worker_job_handler(
   }
   let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
-  let response = reqwest::Client::new().post(format!("{base}/v1/jobs/{job_id}/cancel")).json(&serde_json::json!({"targetRequestId": request_id})).send().await.map_err(|err| {
+  let response = playwright_http_client(Duration::from_secs(15)).map_err(|err| {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{"code":"PLAYWRIGHT_RUNTIME_OFFLINE","message":err.to_string()}})))
+  })?.post(format!("{base}/v1/jobs/{job_id}/cancel")).json(&serde_json::json!({"targetRequestId": request_id})).send().await.map_err(|err| {
     (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{"code":"PLAYWRIGHT_RUNTIME_OFFLINE","message":err.to_string()}})))
   })?;
   let status = response.status();
@@ -1564,6 +1578,21 @@ pub async fn cancel_worker_job_handler(
     .unwrap_or_default();
   if !status.is_success() {
     return Err((status, Json(body)));
+  }
+  let cancelled = body.get("cancelled").and_then(|v| v.as_bool()) == Some(true);
+  let echoed_request = body.get("requestId").and_then(|v| v.as_str()) == Some(request_id);
+  let acknowledged = body
+    .get("acknowledgment")
+    .and_then(|v| v.get("ok"))
+    .and_then(|v| v.as_bool())
+    == Some(true);
+  if !(cancelled && echoed_request && acknowledged) {
+    return Err((
+      StatusCode::CONFLICT,
+      Json(
+        serde_json::json!({"error":{"code":"CANCEL_UNCONFIRMED","message":"Sidecar did not acknowledge the requested active job cancellation","details":body}}),
+      ),
+    ));
   }
   Ok(Json(serde_json::json!({
     "protocol":"floword-production", "protocolVersion":1,
@@ -1579,9 +1608,7 @@ async fn dispatch_to_playwright_provider(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
   let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
-  let response = reqwest::Client::builder()
-    .timeout(playwright_dispatch_timeout(payload))
-    .build()
+  let response = playwright_http_client(playwright_dispatch_timeout(payload))
     .map_err(|e| {
       provider_error(
         "PLAYWRIGHT_RUNTIME_OFFLINE",
