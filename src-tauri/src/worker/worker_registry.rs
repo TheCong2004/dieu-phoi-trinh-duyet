@@ -1,6 +1,7 @@
 use super::worker_types::*;
 use chrono::{DateTime, Duration, Utc};
 use lazy_static::lazy_static;
+use log::info;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -239,6 +240,21 @@ impl WorkerRegistry {
 
     let worker = state.workers.get_mut(&target_key).unwrap();
 
+    let raw_capabilities = req.capabilities.clone();
+    let normalized_capabilities: Vec<String> = raw_capabilities
+      .iter()
+      .map(|cap| normalize_capability(cap))
+      .collect();
+    info!(
+      "Worker registration profile_id={} worker_id={} extension_version={} raw_capabilities={:?} normalized_capabilities={:?} auth_state={:?}",
+      req.profile_id,
+      target_key,
+      req.extension_version,
+      raw_capabilities,
+      normalized_capabilities,
+      req.logged_in
+    );
+
     if worker.profile_id != req.profile_id {
       worker.state = WorkerState::Error;
       return Err(WorkerError::new(
@@ -290,14 +306,20 @@ impl WorkerRegistry {
           _ => None,
         };
         if let Some(s) = site {
-          worker.site_capabilities.insert(s, caps);
+          worker.site_capabilities.insert(
+            s,
+            caps
+              .into_iter()
+              .map(|cap| normalize_capability(&cap))
+              .collect(),
+          );
         }
       }
     } else if !req.capabilities.is_empty() {
       // Default legacy unpartitioned capabilities to Grok site
       worker
         .site_capabilities
-        .insert(ProductionSite::Grok, req.capabilities);
+        .insert(ProductionSite::Grok, normalized_capabilities);
     }
 
     // Derive worker.capabilities as the deduplicated union of all site capabilities.
@@ -311,21 +333,10 @@ impl WorkerRegistry {
           && cap.as_str() != "social.tiktok.publish"
           && cap.as_str() != "social.youtube.publish"
       })
-      .cloned()
+      .map(|cap| normalize_capability(cap))
       .collect();
     all_caps.sort();
     all_caps.dedup();
-    for default_cap in [
-      "grok.image.edit",
-      "grok.expand.9_16",
-      "grok.video.generate",
-      "grok.video.upscale",
-      "grok.prompt.queue",
-    ] {
-      if !all_caps.iter().any(|c| c == default_cap) {
-        all_caps.push(default_cap.to_string());
-      }
-    }
     worker.capabilities = all_caps;
 
     // Global WorkerState represents overall browser worker runtime readiness (not a single social login)
@@ -449,22 +460,17 @@ impl WorkerRegistry {
       }
     }
 
-    // 3. Capability constraint (CRITICAL: Every acquire MUST match capability, pinned or unpinned)
-    if !worker.capabilities.contains(&req.capability) {
-      return Err(WorkerError::new(
-        WorkerErrorCode::CapabilityUnavailable,
-        format!(
-          "Worker does not support required capability '{}'",
-          req.capability
-        ),
-      ));
-    }
-
-    // 4. Extension readiness and protocol version
-    if !worker.extension_ready {
+    // 3. Bring offline workers through the auto-launch path before checking
+    // capabilities. A newly-created worker intentionally starts with an empty
+    // capability list; treat it as extension-unavailable until the health
+    // handshake reports capabilities so ArtCraft can auto-launch/retry.
+    if worker.state == WorkerState::Offline
+      || !worker.extension_ready
+      || worker.capabilities.is_empty()
+    {
       return Err(WorkerError::new(
         WorkerErrorCode::ExtensionUnavailable,
-        "Worker extension is not ready or not connected",
+        "Worker extension is not ready, not connected, or has not reported capabilities",
       ));
     }
     if worker.protocol_version != Some(1) {
@@ -473,6 +479,19 @@ impl WorkerRegistry {
         format!(
           "Worker extension protocol version is incompatible: {:?}",
           worker.protocol_version
+        ),
+      ));
+    }
+
+    // 4. Capability constraint (CRITICAL: Every acquire MUST match capability,
+    // pinned or unpinned). READY workers still fail closed when the extension
+    // does not advertise the requested method.
+    if !worker.capabilities.contains(&req.capability) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::CapabilityUnavailable,
+        format!(
+          "Worker does not support required capability '{}'",
+          req.capability
         ),
       ));
     }
@@ -545,8 +564,11 @@ impl WorkerRegistry {
   /// Atomically acquires an exclusive worker lease for a specific step attempt.
   pub async fn acquire(
     &self,
-    req: AcquireWorkerRequest,
+    mut req: AcquireWorkerRequest,
   ) -> Result<AcquireWorkerResponse, WorkerError> {
+    // Normalize legacy aliases once at the API boundary. Lease records and
+    // dispatch validation always use canonical capability names.
+    req.capability = normalize_capability(&req.capability);
     let mut state = self.state.lock().await;
 
     // Startup Readiness Barrier: Reject with 503 if still initializing

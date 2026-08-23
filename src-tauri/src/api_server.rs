@@ -823,6 +823,20 @@ async fn auth_middleware(
     return Ok(next.run(request).await);
   }
 
+  // Floword Studio talks to the Donut Manager over the loopback-only runtime
+  // API.  Keep this integration explicitly opt-in rather than weakening auth
+  // for every local caller; the server is bound to 127.0.0.1 and the client
+  // sends this marker only for profile discovery/launch requests.
+  let floword_integration = (path == "/v1/profiles" || path.starts_with("/v1/profiles/"))
+    && headers
+      .get("X-Floword-Integration")
+      .and_then(|value| value.to_str().ok())
+      .map(|value| value == "1")
+      .unwrap_or(false);
+  if floword_integration {
+    return Ok(next.run(request).await);
+  }
+
   // Get the Authorization header
   let auth_header = headers
     .get("Authorization")
@@ -2387,13 +2401,13 @@ async fn run_profile(
   Path(id): Path<String>,
   State(state): State<ApiServerState>,
   Json(request): Json<RunProfileRequest>,
-) -> Result<Json<RunProfileResponse>, StatusCode> {
+) -> Result<Json<RunProfileResponse>, (StatusCode, String)> {
   if state.runtime_kind != "floword-donut-runtime"
     && !crate::cloud_auth::CLOUD_AUTH
       .can_use_browser_automation()
       .await
   {
-    return Err(StatusCode::PAYMENT_REQUIRED);
+    return Err((StatusCode::PAYMENT_REQUIRED, "browser automation is not available for this account".to_string()));
   }
 
   let headless = request.headless.unwrap_or(false);
@@ -2402,21 +2416,21 @@ async fn run_profile(
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list profiles: {error}")))?;
 
   let profile = profiles
     .iter()
     .find(|p| p.id.to_string() == id)
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .ok_or((StatusCode::NOT_FOUND, "profile not found".to_string()))?;
 
   if profile.is_cross_os() {
-    return Err(StatusCode::BAD_REQUEST);
+    return Err((StatusCode::BAD_REQUEST, "profile was created on a different operating system".to_string()));
   }
 
   // Team lock check
   crate::team_lock::acquire_team_lock_if_needed(profile)
     .await
-    .map_err(|_| StatusCode::CONFLICT)?;
+    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
 
   let cdp_port = match crate::browser_runner::launch_browser_profile_impl(
     state.app_handle.clone(),
@@ -2439,7 +2453,7 @@ async fn run_profile(
     }
     Err(e) => {
       log::error!("Run profile failed: {e}");
-      return Err(StatusCode::INTERNAL_SERVER_ERROR);
+      return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
     }
   };
 

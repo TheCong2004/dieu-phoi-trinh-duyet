@@ -2012,12 +2012,25 @@ impl ProxyManager {
     }
     let proxy_id = {
       let map = self.profile_active_proxy_ids.lock().unwrap();
-      match map.get(profile_id) {
-        Some(id) => id.clone(),
-        None => return false,
-      }
+      map.get(profile_id).cloned()
+    }
+    .or_else(|| {
+      // A launch can race the profile-index update: the active proxy already
+      // carries the profile id even when the secondary profile map has not
+      // been populated yet. Recover from the authoritative in-memory worker
+      // entry instead of tearing down a browser that is already running.
+      let proxies = self.active_proxies.lock().unwrap();
+      proxies
+        .values()
+        .find(|proxy| proxy.profile_id.as_deref() == Some(profile_id))
+        .map(|proxy| proxy.id.clone())
+    });
+    let Some(proxy_id) = proxy_id else {
+      log::warn!("No active proxy found for profile {profile_id} while recording browser PID {browser_pid}");
+      return false;
     };
     let Some(mut cfg) = crate::proxy_storage::get_proxy_config(&proxy_id) else {
+      log::warn!("Active proxy config {proxy_id} is unavailable while recording browser PID {browser_pid}");
       return false;
     };
     cfg.browser_pid = Some(browser_pid);

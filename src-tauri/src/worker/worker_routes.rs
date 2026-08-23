@@ -756,15 +756,8 @@ pub async fn probe_worker_health(
         protocol_version: 1,
         extension_version: "1.1.49".to_string(),
         worker_state: "BUSY".to_string(),
-        logged_in: Some(true),
-        capabilities: vec![
-          "grok.image.edit".to_string(),
-          "grok.expand.9_16".to_string(),
-          "grok.video.generate".to_string(),
-          "social.facebook.publish".to_string(),
-          "social.tiktok.publish".to_string(),
-          "social.youtube.publish".to_string(),
-        ],
+        logged_in: w.grok_logged_in,
+        capabilities: w.capabilities,
         site_sessions: Vec::new(),
         site_capabilities: std::collections::HashMap::new(),
       });
@@ -881,13 +874,7 @@ pub async fn probe_worker_health(
                   .filter_map(|c| c.as_str().map(|s| s.to_string()))
                   .collect::<Vec<String>>()
               })
-              .unwrap_or_else(|| {
-                vec![
-                  "grok.image.edit".to_string(),
-                  "grok.image.expand_9_16".to_string(),
-                  "grok.video.generate".to_string(),
-                ]
-              });
+              .unwrap_or_default();
 
             extension_version = ext_ver.to_string();
             grok_logged_in = Some(is_logged_in);
@@ -909,7 +896,13 @@ pub async fn probe_worker_health(
               account_identifier: None,
               message: None,
             });
-            site_capabilities.insert("grok".to_string(), reported_caps);
+            site_capabilities.insert(
+              "grok".to_string(),
+              reported_caps
+                .iter()
+                .map(|cap| normalize_capability(cap))
+                .collect(),
+            );
           }
           _ => {
             grok_logged_in = Some(false);

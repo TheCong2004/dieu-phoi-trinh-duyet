@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+// Canonical Floword production capability names. These are the only names
+// persisted in the worker registry and used by lease/dispatch validation.
+pub const GROK_IMAGE_EDIT: &str = "grok.image.edit";
+pub const GROK_IMAGE_EXPAND_9_16: &str = "grok.image.expand_9_16";
+pub const GROK_VIDEO_GENERATE: &str = "grok.video.generate";
+
+/// Normalize capability names received from older extension builds. Unknown
+/// capabilities are preserved so the runtime never grants capabilities that
+/// were not actually reported by the extension handshake.
+pub fn normalize_capability(raw: &str) -> String {
+  match raw.trim() {
+    "grok_image_edit" => GROK_IMAGE_EDIT.to_string(),
+    "grok_expand_9_16" | "grok.expand.9_16" => GROK_IMAGE_EXPAND_9_16.to_string(),
+    "grok_video_generate" => GROK_VIDEO_GENERATE.to_string(),
+    value => value.to_string(),
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkerState {
@@ -107,24 +125,21 @@ impl ProductionMethodDescriptor {
       }),
       "grok.image.edit" => Some(ProductionMethodDescriptor {
         method: "grok.image.edit",
-        required_capability: "grok.image.edit",
+        required_capability: GROK_IMAGE_EDIT,
         site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
       }),
       "grok.image.expand_9_16" => Some(ProductionMethodDescriptor {
         method: "grok.image.expand_9_16",
-        // The extension advertises the canonical capability without the
-        // `image` namespace. Keep the method name stable for Floword while
-        // matching the capability used by the worker health handshake.
-        required_capability: "grok.expand.9_16",
+        required_capability: GROK_IMAGE_EXPAND_9_16,
         site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
       }),
       "grok.video.generate" => Some(ProductionMethodDescriptor {
         method: "grok.video.generate",
-        required_capability: "grok.video.generate",
+        required_capability: GROK_VIDEO_GENERATE,
         site_policy: ProductionSitePolicy::Site(ProductionSite::Grok),
         requires_auth: true,
         implemented: true,
@@ -226,17 +241,17 @@ impl CapabilityPolicy {
         requires_auth: false,
       }),
       "grok.image.edit" => Some(CapabilityPolicy {
-        capability: "grok.image.edit",
+        capability: GROK_IMAGE_EDIT,
         site: ProductionSite::Grok,
         requires_auth: true,
       }),
       "grok.image.expand_9_16" => Some(CapabilityPolicy {
-        capability: "grok.expand.9_16",
+        capability: GROK_IMAGE_EXPAND_9_16,
         site: ProductionSite::Grok,
         requires_auth: true,
       }),
       "grok.video.generate" => Some(CapabilityPolicy {
-        capability: "grok.video.generate",
+        capability: GROK_VIDEO_GENERATE,
         site: ProductionSite::Grok,
         requires_auth: true,
       }),
@@ -347,7 +362,9 @@ impl WorkerError {
       | WorkerErrorCode::GrokNotLoggedIn
       | WorkerErrorCode::SiteSessionNotReady
       | WorkerErrorCode::LeaseNotActive => 409,
-      WorkerErrorCode::CapabilityUnavailable => 501,
+      // A known capability with no eligible worker is a conflict with the
+      // current worker/session state, not an unimplemented HTTP method.
+      WorkerErrorCode::CapabilityUnavailable => 409,
       WorkerErrorCode::InvalidLease
       | WorkerErrorCode::CorrelationMismatch
       | WorkerErrorCode::ProtocolMismatch
@@ -551,4 +568,56 @@ pub struct VerifyPublicationError {
   pub code: String,
   pub message: String,
   pub retryable: bool,
+}
+
+#[cfg(test)]
+mod capability_contract_tests {
+  use super::*;
+
+  #[test]
+  fn normalizes_legacy_grok_aliases_to_canonical_names() {
+    assert_eq!(normalize_capability("grok_image_edit"), GROK_IMAGE_EDIT);
+    assert_eq!(
+      normalize_capability("grok_expand_9_16"),
+      GROK_IMAGE_EXPAND_9_16
+    );
+    assert_eq!(
+      normalize_capability("grok.expand.9_16"),
+      GROK_IMAGE_EXPAND_9_16
+    );
+    assert_eq!(
+      normalize_capability("grok_video_generate"),
+      GROK_VIDEO_GENERATE
+    );
+  }
+
+  #[test]
+  fn preserves_unknown_capabilities_without_granting_defaults() {
+    assert_eq!(
+      normalize_capability("grok.custom.experimental"),
+      "grok.custom.experimental"
+    );
+  }
+
+  #[test]
+  fn production_methods_require_canonical_capabilities() {
+    assert_eq!(
+      ProductionMethodDescriptor::lookup("grok.image.edit")
+        .unwrap()
+        .required_capability,
+      GROK_IMAGE_EDIT
+    );
+    assert_eq!(
+      ProductionMethodDescriptor::lookup("grok.image.expand_9_16")
+        .unwrap()
+        .required_capability,
+      GROK_IMAGE_EXPAND_9_16
+    );
+    assert_eq!(
+      ProductionMethodDescriptor::lookup("grok.video.generate")
+        .unwrap()
+        .required_capability,
+      GROK_VIDEO_GENERATE
+    );
+  }
 }

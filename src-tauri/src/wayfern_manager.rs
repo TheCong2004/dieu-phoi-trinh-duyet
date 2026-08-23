@@ -1076,16 +1076,22 @@ impl WayfernManager {
 
     // Geolocation is handled internally by the browser binary.
 
-    if let Some(url) = url {
-      log::info!("Navigating to URL via CDP");
-      if let Some(target) = page_targets.first() {
-        if let Some(ws_url) = &target.websocket_debugger_url {
-          if let Err(e) = self
-            .send_cdp_command(ws_url, "Page.navigate", json!({ "url": url }))
-            .await
-          {
-            log::error!("Failed to navigate to URL: {e}");
-          }
+    // A profile can contain a restored tab from an old dev server (for
+    // example, http://127.0.0.1:12341).  When the caller did not request a
+    // URL, do not expose that stale tab as the newly launched browser: it
+    // produces a misleading ERR_CONNECTION_REFUSED page and prevents the
+    // Floword worker from taking over the first page reliably.  Start from a
+    // deterministic blank tab instead; callers that supplied a URL still get
+    // the requested navigation below.
+    let initial_url = url.as_deref().unwrap_or("about:blank");
+    log::info!("Navigating initial page via CDP to {initial_url}");
+    if let Some(target) = page_targets.first() {
+      if let Some(ws_url) = &target.websocket_debugger_url {
+        if let Err(e) = self
+          .send_cdp_command(ws_url, "Page.navigate", json!({ "url": initial_url }))
+          .await
+        {
+          log::error!("Failed to navigate initial page: {e}");
         }
       }
     }
