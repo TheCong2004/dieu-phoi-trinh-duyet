@@ -124,12 +124,45 @@ async fn ensure_playwright_worker(
   // Playwright sidecar. The sidecar must never launch a second browser.
   let donut_base = std::env::var("FLOWORD_DONUT_BROWSER_API_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:10108".to_string());
+  let profiles: serde_json::Value = client
+    .get(format!("{donut_base}/v1/profiles"))
+    .send()
+    .await
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Donut profile catalog unavailable: {e}"),
+      )
+    })?
+    .json()
+    .await
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        format!("Invalid Donut profile catalog: {e}"),
+      )
+    })?;
+  let already_running = profiles
+    .get("profiles")
+    .and_then(|v| v.as_array())
+    .and_then(|items| {
+      items
+        .iter()
+        .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(profile_id))
+    })
+    .and_then(|item| item.get("is_running").and_then(|v| v.as_bool()))
+    .unwrap_or(false);
+  let run_body = if already_running {
+    serde_json::json!({ "headless": false })
+  } else {
+    serde_json::json!({ "url": "https://grok.com/imagine", "headless": false })
+  };
   let run = client
     .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
     // Do not pass a URL here: /run opens a new tab when a profile is already
     // running. Donut owns tab selection; the sidecar only attaches to the
     // existing managed Grok tab over CDP.
-    .json(&serde_json::json!({ "headless": false }))
+    .json(&run_body)
     .send()
     .await
     .map_err(|e| {
