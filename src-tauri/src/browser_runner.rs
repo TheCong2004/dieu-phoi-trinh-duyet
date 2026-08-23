@@ -1441,6 +1441,7 @@ pub async fn launch_browser_profile_impl(
     let worker = crate::worker::BrowserWorker {
       worker_id,
       profile_id: updated_profile.id.to_string(),
+      provider: crate::worker::WorkerProvider::Wayfern,
       pool_id: updated_profile.group_id.clone(),
       state: crate::worker::WorkerState::Starting,
       capabilities: vec![],

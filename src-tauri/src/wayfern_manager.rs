@@ -1083,7 +1083,7 @@ impl WayfernManager {
     // Floword worker from taking over the first page reliably.  Start from a
     // deterministic blank tab instead; callers that supplied a URL still get
     // the requested navigation below.
-    let initial_url = url.as_deref().unwrap_or("about:blank");
+    let initial_url = url.unwrap_or("about:blank");
     log::info!("Navigating initial page via CDP to {initial_url}");
     if let Some(target) = page_targets.first() {
       if let Some(ws_url) = &target.websocket_debugger_url {

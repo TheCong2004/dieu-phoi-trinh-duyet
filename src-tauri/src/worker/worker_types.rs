@@ -32,17 +32,12 @@ pub enum WorkerState {
   Error,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkerProvider {
   Playwright,
+  #[default]
   Wayfern,
-}
-
-impl Default for WorkerProvider {
-  fn default() -> Self {
-    Self::Wayfern
-  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -443,6 +438,10 @@ impl std::error::Error for WorkerError {}
 pub struct BrowserWorker {
   pub worker_id: String,
   pub profile_id: String,
+  /// Canonical provider ownership. `default` keeps legacy registry records
+  /// readable without inferring provider from worker-id naming conventions.
+  #[serde(default)]
+  pub provider: WorkerProvider,
   pub pool_id: Option<String>,
   pub state: WorkerState,
   pub capabilities: Vec<String>,
@@ -462,11 +461,7 @@ pub struct BrowserWorker {
 
 impl BrowserWorker {
   pub fn provider(&self) -> WorkerProvider {
-    if self.worker_id.starts_with("playwright-profile:") {
-      WorkerProvider::Playwright
-    } else {
-      WorkerProvider::Wayfern
-    }
+    self.provider
   }
 }
 

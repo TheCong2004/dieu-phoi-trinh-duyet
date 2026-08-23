@@ -81,29 +81,117 @@ pub async fn acquire_worker_handler(
   }
 }
 
-fn error_response(error: super::worker_types::WorkerError) -> (StatusCode, Json<serde_json::Value>) {
+fn error_response(
+  error: super::worker_types::WorkerError,
+) -> (StatusCode, Json<serde_json::Value>) {
   let status = StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-  (status, Json(serde_json::json!({ "error": { "code": error.code_str(), "message": error.message, "retryable": true } })))
+  (
+    status,
+    Json(
+      serde_json::json!({ "error": { "code": error.code_str(), "message": error.message, "retryable": true } }),
+    ),
+  )
 }
 
-async fn ensure_playwright_worker(profile_id: &str, req: &AcquireWorkerRequest) -> Result<(), super::worker_types::WorkerError> {
-  let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
-  let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
+async fn ensure_playwright_worker(
+  profile_id: &str,
+  req: &AcquireWorkerRequest,
+) -> Result<(), super::worker_types::WorkerError> {
+  let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
+    .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
+  let client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(30))
+    .build()
+    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
   let start = client.post(format!("{base}/v1/profiles/{profile_id}/start")).json(&serde_json::json!({ "url": "https://grok.com/imagine", "extensionPath": std::env::var("FLOWORD_CHROMEX_EXTENSION_PATH").ok() })).send().await.map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Playwright runtime unavailable: {e}")))?;
-  if !start.status().is_success() { return Err(WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Playwright profile start failed: {}", start.status()))); }
-  let status: serde_json::Value = client.get(format!("{base}/v1/profiles/{profile_id}/status")).send().await.map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?.json().await.map_err(|e| WorkerError::new(WorkerErrorCode::InvalidHealthResponse, e.to_string()))?;
+  if !start.status().is_success() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Playwright profile start failed: {}", start.status()),
+    ));
+  }
+  let status: serde_json::Value = client
+    .get(format!("{base}/v1/profiles/{profile_id}/status"))
+    .send()
+    .await
+    .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?
+    .json()
+    .await
+    .map_err(|e| WorkerError::new(WorkerErrorCode::InvalidHealthResponse, e.to_string()))?;
   let envelope = status.get("result").unwrap_or(&status);
-  if envelope.get("ok").and_then(|v| v.as_bool()) == Some(false) { let error = envelope.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str()).unwrap_or("Playwright health failed"); return Err(WorkerError::new(WorkerErrorCode::ExtensionUnavailable, error)); }
+  if envelope.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+    let error = envelope
+      .get("error")
+      .and_then(|v| v.get("message"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("Playwright health failed");
+    return Err(WorkerError::new(
+      WorkerErrorCode::ExtensionUnavailable,
+      error,
+    ));
+  }
   let health = envelope.get("result").unwrap_or(envelope);
-  let actual_profile = health.get("profileId").and_then(|v| v.as_str()).unwrap_or("");
-  if actual_profile != profile_id { return Err(WorkerError::new(WorkerErrorCode::InvalidHealthResponse, "Playwright health profileId mismatch")); }
+  let actual_profile = health
+    .get("profileId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  if actual_profile != profile_id {
+    return Err(WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      "Playwright health profileId mismatch",
+    ));
+  }
   let logged_in = health.get("loggedIn").and_then(|v| v.as_bool());
-  let extension_version = health.get("extensionVersion").and_then(|v| v.as_str()).map(str::to_string);
-  let protocol_version = health.get("protocolVersion").and_then(|v| v.as_u64()).map(|v| v as u32);
-  let capabilities = health.get("capabilities").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-  if protocol_version != Some(1) || extension_version.is_none() { return Err(WorkerError::new(WorkerErrorCode::ProtocolMismatch, "Playwright extension health is not ready")); }
-  let worker = BrowserWorker { worker_id: format!("playwright-profile:{profile_id}"), profile_id: profile_id.to_string(), pool_id: req.pool_id.clone(), state: if logged_in == Some(false) { WorkerState::LoginRequired } else { WorkerState::Ready }, capabilities: if logged_in == Some(false) { vec![] } else { capabilities }, extension_ready: true, extension_version, protocol_version, grok_logged_in: logged_in, site_sessions: Default::default(), site_capabilities: Default::default(), current_lease_id: None, current_job_id: None, last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()), last_error: None };
-  WORKER_REGISTRY.register_or_update_worker(worker).await.map_err(|e| e)
+  let extension_version = health
+    .get("extensionVersion")
+    .and_then(|v| v.as_str())
+    .map(str::to_string);
+  let protocol_version = health
+    .get("protocolVersion")
+    .and_then(|v| v.as_u64())
+    .map(|v| v as u32);
+  let capabilities = health
+    .get("capabilities")
+    .and_then(|v| v.as_array())
+    .map(|a| {
+      a.iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+    })
+    .unwrap_or_default();
+  if protocol_version != Some(1) || extension_version.is_none() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::ProtocolMismatch,
+      "Playwright extension health is not ready",
+    ));
+  }
+  let worker = BrowserWorker {
+    worker_id: format!("playwright-profile:{profile_id}"),
+    profile_id: profile_id.to_string(),
+    provider: WorkerProvider::Playwright,
+    pool_id: req.pool_id.clone(),
+    state: if logged_in == Some(false) {
+      WorkerState::LoginRequired
+    } else {
+      WorkerState::Ready
+    },
+    capabilities: if logged_in == Some(false) {
+      vec![]
+    } else {
+      capabilities
+    },
+    extension_ready: true,
+    extension_version,
+    protocol_version,
+    grok_logged_in: logged_in,
+    site_sessions: Default::default(),
+    site_capabilities: Default::default(),
+    current_lease_id: None,
+    current_job_id: None,
+    last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
+    last_error: None,
+  };
+  WORKER_REGISTRY.register_or_update_worker(worker).await
 }
 
 /// Registers workers owned by an external runtime provider (for example the
@@ -111,17 +199,38 @@ async fn ensure_playwright_worker(profile_id: &str, req: &AcquireWorkerRequest) 
 pub async fn register_worker_handler(
   Json(payload): Json<BrowserWorker>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-  if !payload.worker_id.starts_with("playwright-profile:") || payload.profile_id.is_empty() {
-    return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": { "code": "INVALID_WORKER_PROVIDER", "message": "Only canonical Playwright workers may register through this endpoint" } }))));
+  if payload.provider != WorkerProvider::Playwright || payload.profile_id.is_empty() {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(
+        serde_json::json!({ "error": { "code": "INVALID_WORKER_PROVIDER", "message": "Only canonical Playwright workers may register through this endpoint" } }),
+      ),
+    ));
   }
-  if payload.extension_ready && (payload.extension_version.is_none() || payload.protocol_version != Some(1)) {
-    return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": { "code": "INVALID_HEALTH_RESPONSE", "message": "Ready worker registration requires extension version and protocol v1" } }))));
+  if payload.extension_ready
+    && (payload.extension_version.is_none() || payload.protocol_version != Some(1))
+  {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(
+        serde_json::json!({ "error": { "code": "INVALID_HEALTH_RESPONSE", "message": "Ready worker registration requires extension version and protocol v1" } }),
+      ),
+    ));
   }
-  match WORKER_REGISTRY.register_or_update_worker(payload.clone()).await {
-    Ok(()) => Ok(Json(serde_json::json!({ "worker_id": payload.worker_id, "profile_id": payload.profile_id, "status": "REGISTERED" }))),
+  match WORKER_REGISTRY
+    .register_or_update_worker(payload.clone())
+    .await
+  {
+    Ok(()) => Ok(Json(
+      serde_json::json!({ "worker_id": payload.worker_id, "profile_id": payload.profile_id, "status": "REGISTERED" }),
+    )),
     Err(err) => {
-      let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-      Err((status, Json(serde_json::json!({ "error": { "code": err.code_str(), "message": err.message } }))))
+      let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+      Err((
+        status,
+        Json(serde_json::json!({ "error": { "code": err.code_str(), "message": err.message } })),
+      ))
     }
   }
 }
@@ -1335,9 +1444,23 @@ pub async fn dispatch_worker_handler(
 
       Ok(Json(result))
     }
-    Err(err) => {
-      let status =
-        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    Err((status, Json(body))) => {
+      let error = body
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+      let code = error
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("PLAYWRIGHT_RUNTIME_OFFLINE");
+      let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Provider dispatch failed");
+      let retryable = error
+        .get("retryable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(status.is_server_error());
       Err((
         status,
         Json(serde_json::json!({
@@ -1351,9 +1474,9 @@ pub async fn dispatch_worker_handler(
           "profileId": profile_id,
           "ok": false,
           "error": {
-            "code": err.code_str(),
-            "message": err.message,
-            "retryable": err.is_transient()
+            "code": code,
+            "message": message,
+            "retryable": retryable
           }
         })),
       ))
@@ -1361,19 +1484,65 @@ pub async fn dispatch_worker_handler(
   }
 }
 
-async fn dispatch_to_playwright_provider(profile_id: &str, payload: &serde_json::Value) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-  let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
-  let response = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| provider_error("PLAYWRIGHT_RUNTIME_OFFLINE", e.to_string(), StatusCode::SERVICE_UNAVAILABLE))?
-    .post(format!("{base}/v1/profiles/{profile_id}/dispatch")).json(payload).send().await
-    .map_err(|e| provider_error("PLAYWRIGHT_RUNTIME_OFFLINE", e.to_string(), StatusCode::SERVICE_UNAVAILABLE))?;
-  let status = response.status(); let body = response.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({"error":{"code":"INVALID_EXTENSION_RESPONSE","message":"Playwright provider returned invalid JSON"}}));
-  if !status.is_success() { let error = body.get("error").cloned().unwrap_or_else(|| serde_json::json!({"code":"PLAYWRIGHT_RUNTIME_OFFLINE","message":"Playwright provider request failed"})); let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("PLAYWRIGHT_RUNTIME_OFFLINE"); let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Playwright provider request failed"); return Err(provider_error(code, message.to_string(), status)); }
+async fn dispatch_to_playwright_provider(
+  profile_id: &str,
+  payload: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+  let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
+    .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
+  let response = reqwest::Client::builder()
+    .timeout(Duration::from_secs(120))
+    .build()
+    .map_err(|e| {
+      provider_error(
+        "PLAYWRIGHT_RUNTIME_OFFLINE",
+        e.to_string(),
+        StatusCode::SERVICE_UNAVAILABLE,
+      )
+    })?
+    .post(format!("{base}/v1/profiles/{profile_id}/dispatch"))
+    .json(payload)
+    .send()
+    .await
+    .map_err(|e| {
+      provider_error(
+        "PLAYWRIGHT_RUNTIME_OFFLINE",
+        e.to_string(),
+        StatusCode::SERVICE_UNAVAILABLE,
+      )
+    })?;
+  let status = response.status();
+  let body = response.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({"error":{"code":"INVALID_EXTENSION_RESPONSE","message":"Playwright provider returned invalid JSON"}}));
+  if !status.is_success() {
+    let error = body.get("error").cloned().unwrap_or_else(|| serde_json::json!({"code":"PLAYWRIGHT_RUNTIME_OFFLINE","message":"Playwright provider request failed"}));
+    let code = error
+      .get("code")
+      .and_then(|v| v.as_str())
+      .unwrap_or("PLAYWRIGHT_RUNTIME_OFFLINE");
+    let message = error
+      .get("message")
+      .and_then(|v| v.as_str())
+      .unwrap_or("Playwright provider request failed");
+    return Err(provider_error(code, message.to_string(), status));
+  }
   Ok(body)
 }
 
-fn provider_error(code: &str, message: String, status: StatusCode) -> (StatusCode, Json<serde_json::Value>) { (status, Json(serde_json::json!({"error":{"code":code,"message":message,"retryable":status.is_server_error()}}))) }
+fn provider_error(
+  code: &str,
+  message: String,
+  status: StatusCode,
+) -> (StatusCode, Json<serde_json::Value>) {
+  (
+    status,
+    Json(
+      serde_json::json!({"error":{"code":code,"message":message,"retryable":status.is_server_error()}}),
+    ),
+  )
+}
 
 fn map_legacy_dispatch_error(error: WorkerError) -> (StatusCode, Json<serde_json::Value>) {
-  let status = StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+  let status =
+    StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
   provider_error(error.code_str(), error.message, status)
 }

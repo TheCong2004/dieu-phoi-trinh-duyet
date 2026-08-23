@@ -187,6 +187,7 @@ impl WorkerRegistry {
         .or_insert_with(|| BrowserWorker {
           worker_id: worker_id.clone(),
           profile_id: profile.id.to_string(),
+          provider: WorkerProvider::Wayfern,
           pool_id: profile.group_id.clone(),
           state: default_state,
           capabilities: vec![],
@@ -468,6 +469,24 @@ impl WorkerRegistry {
       }
     }
 
+    // Eligibility is ordered from ownership to readiness. A leased worker is
+    // BUSY, and an unauthenticated Grok session is reported explicitly before
+    // extension/capability diagnostics can mask the actionable error.
+    if worker.current_lease_id.is_some()
+      || matches!(worker.state, WorkerState::Busy | WorkerState::Leased)
+    {
+      return Err(WorkerError::new(
+        WorkerErrorCode::WorkerBusy,
+        "Worker is already assigned to an active lease",
+      ));
+    }
+    if worker.grok_logged_in == Some(false) {
+      return Err(WorkerError::new(
+        WorkerErrorCode::GrokNotLoggedIn,
+        "Worker requires active Grok authenticated session",
+      ));
+    }
+
     // 3. Bring offline workers through the auto-launch path before checking
     // capabilities. A newly-created worker intentionally starts with an empty
     // capability list; treat it as extension-unavailable until the health
@@ -514,21 +533,7 @@ impl WorkerRegistry {
       ));
     }
 
-    // 5. Exclusive Lease check: Must not hold an existing lease
-    if worker.current_lease_id.is_some() {
-      return Err(WorkerError::new(
-        WorkerErrorCode::WorkerBusy,
-        "Worker is already assigned to an active lease",
-      ));
-    }
-
-    // 6. Worker state check:
-    if worker.state == WorkerState::Busy || worker.state == WorkerState::Leased {
-      return Err(WorkerError::new(
-        WorkerErrorCode::WorkerBusy,
-        "Worker is currently busy or leased",
-      ));
-    }
+    // 5. Worker state check:
     if worker.state == WorkerState::Error {
       return Err(WorkerError::new(
         WorkerErrorCode::Internal,
@@ -619,6 +624,28 @@ impl WorkerRegistry {
           w.state = WorkerState::Reconciling;
         }
       }
+    }
+
+    // Acquire is idempotent for the complete step identity. This is important
+    // when the caller retries after a timeout: never create a second lease for
+    // the same job/step/attempt/profile/capability tuple.
+    if let Some(existing) = state.leases.values().find(|lease| {
+      lease.status == LeaseStatus::Active
+        && lease.job_id == req.job_id
+        && lease.step_id == req.step_id
+        && lease.attempt_id == req.attempt_id
+        && lease.capability == req.capability
+        && req
+          .profile_id
+          .as_deref()
+          .is_some_and(|profile| lease.profile_id == profile || lease.worker_id == profile)
+    }) {
+      return Ok(AcquireWorkerResponse {
+        lease_id: existing.lease_id.clone(),
+        worker_id: existing.worker_id.clone(),
+        profile_id: existing.profile_id.clone(),
+        expires_at: existing.expires_at.clone(),
+      });
     }
 
     // 2. Validate pool filter if specified
@@ -1000,6 +1027,7 @@ mod tests {
     let worker = BrowserWorker {
       worker_id: worker_id.to_string(),
       profile_id: profile_id.to_string(),
+      provider: WorkerProvider::Wayfern,
       pool_id: pool_id.map(|s| s.to_string()),
       state: WorkerState::Ready,
       capabilities: vec![
@@ -1044,6 +1072,7 @@ mod tests {
     let worker = BrowserWorker {
       worker_id: "browser-profile:PROFILE_A".to_string(),
       profile_id: "PROFILE_A".to_string(),
+      provider: WorkerProvider::Wayfern,
       pool_id: None,
       state: WorkerState::Starting,
       capabilities: vec![],
@@ -2113,5 +2142,59 @@ mod tests {
       .await;
 
     assert!(acq.is_ok());
+  }
+
+  #[tokio::test]
+  async fn acquire_is_idempotent_and_health_refresh_preserves_lease() {
+    let registry = WorkerRegistry::new();
+    seed_test_worker(&registry, "WORKER_IDEMPOTENT", "PROFILE_IDEMPOTENT", None).await;
+    let request = AcquireWorkerRequest {
+      job_id: "JOB_IDEMPOTENT".into(),
+      step_id: "STEP_IMAGE".into(),
+      attempt_id: "ATTEMPT_1".into(),
+      capability: GROK_IMAGE_EDIT.into(),
+      pool_id: None,
+      profile_id: Some("PROFILE_IDEMPOTENT".into()),
+      ttl_seconds: Some(120),
+    };
+    let first = registry.acquire(request.clone()).await.unwrap();
+    let second = registry.acquire(request).await.unwrap();
+    assert_eq!(first.lease_id, second.lease_id);
+
+    registry
+      .handle_health_handshake(
+        "WORKER_IDEMPOTENT",
+        WorkerHealthHandshakeRequest {
+          profile_id: "PROFILE_IDEMPOTENT".into(),
+          protocol_version: 1,
+          extension_version: "1.1.49".into(),
+          worker_state: "BUSY".into(),
+          logged_in: Some(true),
+          capabilities: vec![GROK_IMAGE_EDIT.into()],
+          site_sessions: vec![],
+          site_capabilities: std::collections::HashMap::new(),
+        },
+      )
+      .await
+      .unwrap();
+    let state = registry.state.lock().await;
+    let worker = state.workers.get("WORKER_IDEMPOTENT").unwrap();
+    assert_eq!(
+      worker.current_lease_id.as_deref(),
+      Some(first.lease_id.as_str())
+    );
+    assert_eq!(worker.current_job_id.as_deref(), Some("JOB_IDEMPOTENT"));
+    assert!(matches!(
+      worker.state,
+      WorkerState::Leased | WorkerState::Busy
+    ));
+    assert_eq!(
+      state
+        .leases
+        .values()
+        .filter(|lease| lease.status == LeaseStatus::Active && lease.worker_id == worker.worker_id)
+        .count(),
+      1
+    );
   }
 }
