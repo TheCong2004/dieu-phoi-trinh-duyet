@@ -37,6 +37,10 @@ pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
       "/v1/workers/{worker_id}/dispatch",
       post(dispatch_worker_handler),
     )
+    .route(
+      "/v1/workers/{worker_id}/jobs/{job_id}/cancel",
+      post(cancel_worker_job_handler),
+    )
     .route("/v1/workers", get(list_workers_handler))
     .route("/v1/workers/leases", get(list_leases_handler))
     .route("/v1/publications/verify", post(verify_publication_handler))
@@ -1482,6 +1486,91 @@ pub async fn dispatch_worker_handler(
       ))
     }
   }
+}
+
+/// Canonical cancellation path for Playwright jobs. Cancellation is an
+/// operation on the active lease, not a separately acquired capability.
+pub async fn cancel_worker_job_handler(
+  Path((worker_id, job_id)): Path<(String, String)>,
+  Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+  let step_id = payload.get("stepId").and_then(|v| v.as_str()).unwrap_or("");
+  let attempt_id = payload
+    .get("attemptId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  let lease_id = payload
+    .get("leaseId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  let profile_id = payload
+    .get("profileId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  let request_id = payload
+    .get("targetRequestId")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  if step_id.is_empty()
+    || attempt_id.is_empty()
+    || lease_id.is_empty()
+    || profile_id.is_empty()
+    || request_id.is_empty()
+  {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(
+        serde_json::json!({"error":{"code":"INVALID_REQUEST","message":"stepId, attemptId, leaseId, profileId and targetRequestId are required"}}),
+      ),
+    ));
+  }
+  let lease = WORKER_REGISTRY
+    .validate_active_lease(lease_id, job_id.as_str(), step_id, attempt_id, profile_id)
+    .await
+    .map_err(|err| {
+      (
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::CONFLICT),
+        Json(serde_json::json!({"error":{"code":err.code_str(),"message":err.message}})),
+      )
+    })?;
+  if lease.worker_id != worker_id {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      Json(
+        serde_json::json!({"error":{"code":"INVALID_LEASE","message":"workerId does not match active lease"}}),
+      ),
+    ));
+  }
+  let worker = WORKER_REGISTRY.list_workers().await.workers.into_iter().find(|w| w.worker_id == worker_id).ok_or_else(|| {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":{"code":"WORKER_NOT_FOUND","message":"worker is not registered"}})))
+  })?;
+  if worker.provider != WorkerProvider::Playwright {
+    return Err((
+      StatusCode::CONFLICT,
+      Json(
+        serde_json::json!({"error":{"code":"PROVIDER_UNSUPPORTED","message":"canonical cancellation is only available for Playwright workers"}}),
+      ),
+    ));
+  }
+  let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
+    .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
+  let response = reqwest::Client::new().post(format!("{base}/v1/jobs/{job_id}/cancel")).json(&serde_json::json!({"targetRequestId": request_id})).send().await.map_err(|err| {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{"code":"PLAYWRIGHT_RUNTIME_OFFLINE","message":err.to_string()}})))
+  })?;
+  let status = response.status();
+  let body = response
+    .json::<serde_json::Value>()
+    .await
+    .unwrap_or_default();
+  if !status.is_success() {
+    return Err((status, Json(body)));
+  }
+  Ok(Json(serde_json::json!({
+    "protocol":"floword-production", "protocolVersion":1,
+    "requestId": format!("CANCEL_{}", Uuid::new_v4()), "jobId": job_id,
+    "stepId": step_id, "attemptId": attempt_id, "leaseId": lease_id,
+    "profileId": profile_id, "ok": true, "result": body
+  })))
 }
 
 async fn dispatch_to_playwright_provider(
