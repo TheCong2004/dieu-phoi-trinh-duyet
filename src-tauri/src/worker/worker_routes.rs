@@ -1491,7 +1491,7 @@ async fn dispatch_to_playwright_provider(
   let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
   let response = reqwest::Client::builder()
-    .timeout(Duration::from_secs(120))
+    .timeout(playwright_dispatch_timeout(payload))
     .build()
     .map_err(|e| {
       provider_error(
@@ -1526,6 +1526,16 @@ async fn dispatch_to_playwright_provider(
     return Err(provider_error(code, message.to_string(), status));
   }
   Ok(body)
+}
+
+fn playwright_dispatch_timeout(payload: &serde_json::Value) -> Duration {
+  let requested_ms = payload
+    .get("params")
+    .and_then(|params| params.get("timeoutMs"))
+    .and_then(serde_json::Value::as_u64)
+    .unwrap_or(180_000)
+    .clamp(5_000, 900_000);
+  Duration::from_millis(requested_ms.saturating_add(5_000))
 }
 
 fn provider_error(
