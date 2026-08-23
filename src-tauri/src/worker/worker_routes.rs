@@ -119,11 +119,62 @@ async fn ensure_playwright_worker(
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
   let client = playwright_http_client(Duration::from_secs(30))
     .map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, e.to_string()))?;
-  let start = client.post(format!("{base}/v1/profiles/{profile_id}/start")).json(&serde_json::json!({ "url": "https://grok.com/imagine", "extensionPath": std::env::var("FLOWORD_CHROMEX_EXTENSION_PATH").ok() })).send().await.map_err(|e| WorkerError::new(WorkerErrorCode::BridgeDisconnected, format!("Playwright runtime unavailable: {e}")))?;
+  // Donut owns the browser. Start/reuse the managed Wayfern profile through
+  // Donut's canonical profile API, then hand only its CDP endpoint to the
+  // Playwright sidecar. The sidecar must never launch a second browser.
+  let donut_base = std::env::var("FLOWORD_DONUT_BROWSER_API_URL")
+    .unwrap_or_else(|_| "http://127.0.0.1:10108".to_string());
+  let run = client
+    .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
+    .json(&serde_json::json!({ "url": "https://grok.com/imagine", "headless": false }))
+    .send()
+    .await
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Donut browser unavailable: {e}"),
+      )
+    })?;
+  if !run.status().is_success() {
+    return Err(WorkerError::new(
+      WorkerErrorCode::BridgeDisconnected,
+      format!("Donut profile run failed: {}", run.status()),
+    ));
+  }
+  let run_body: serde_json::Value = run.json().await.map_err(|e| {
+    WorkerError::new(
+      WorkerErrorCode::InvalidHealthResponse,
+      format!("Invalid Donut run response: {e}"),
+    )
+  })?;
+  let cdp_port = run_body
+    .get("remote_debugging_port")
+    .and_then(|v| v.as_u64())
+    .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+    .ok_or_else(|| {
+      WorkerError::new(
+        WorkerErrorCode::InvalidHealthResponse,
+        "Donut run response omitted remote_debugging_port",
+      )
+    })?;
+  let start = client
+    .post(format!("{base}/v1/profiles/{profile_id}/start"))
+    .json(&serde_json::json!({
+      "url": "https://grok.com/imagine",
+      "cdpEndpoint": format!("http://127.0.0.1:{cdp_port}")
+    }))
+    .send()
+    .await
+    .map_err(|e| {
+      WorkerError::new(
+        WorkerErrorCode::BridgeDisconnected,
+        format!("Playwright runtime unavailable: {e}"),
+      )
+    })?;
   if !start.status().is_success() {
     return Err(WorkerError::new(
       WorkerErrorCode::BridgeDisconnected,
-      format!("Playwright profile start failed: {}", start.status()),
+      format!("Playwright CDP attach failed: {}", start.status()),
     ));
   }
   let status: serde_json::Value = client
