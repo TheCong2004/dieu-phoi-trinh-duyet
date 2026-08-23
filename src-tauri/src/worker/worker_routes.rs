@@ -633,6 +633,7 @@ pub async fn dispatch_to_profile_extension(
   );
 
   let mut target_context_id: Option<i64> = None;
+  let mut last_context_error: Option<WorkerError> = None;
   for attempt in 1..=6 {
     let candidate_ids: Vec<i64> = if !isolated_context_ids.is_empty() {
       isolated_context_ids.clone()
@@ -641,7 +642,7 @@ pub async fn dispatch_to_profile_extension(
     };
 
     for cid in candidate_ids {
-      if let Ok(res) = send_cdp_evaluate(
+      match send_cdp_evaluate(
         &mut ws_stream,
         (100 * attempt + cid) as u64,
         &bind_expr,
@@ -650,11 +651,13 @@ pub async fn dispatch_to_profile_extension(
       )
       .await
       {
-        if res.as_bool() == Some(true) {
+        Ok(res) if res.as_bool() == Some(true) => {
           target_context_id = Some(cid);
           log::info!("[WorkerDispatch] Extension context bound: id={cid} (attempt {attempt})");
           break;
         }
+        Ok(_) => {}
+        Err(error) => last_context_error = Some(error),
       }
     }
 
@@ -664,8 +667,24 @@ pub async fn dispatch_to_profile_extension(
     tokio::time::sleep(Duration::from_millis(800)).await;
   }
 
-  // Fallback: If isolated context not identified, try context 1 or default
-  let target_context_id = target_context_id.unwrap_or(1);
+  // Fail closed when the extension isolated world was not found. Context 1 is
+  // the page's default world and must never be used for privileged production
+  // commands: doing so hides an extension injection/build problem and can
+  // execute against the wrong JavaScript authority.
+  let target_context_id = match target_context_id {
+    Some(context_id) => context_id,
+    None => {
+      if let Some(error) = last_context_error {
+        if error.message.contains("paid Donut Browser plan") {
+          return Err(error);
+        }
+      }
+      return Err(WorkerError::new(
+        WorkerErrorCode::ExtensionContextNotFound,
+        "Floword extension isolated context was not ready on the target page",
+      ));
+    }
+  };
 
   // 5. Execute production command directly in verified isolated context
   let payload_json_str = serde_json::to_string(payload).map_err(|e| {
@@ -904,7 +923,23 @@ pub async fn probe_worker_health(
                 .collect(),
             );
           }
-          _ => {
+          Ok(res) => {
+            grok_logged_in = Some(false);
+            let message = res
+              .get("error")
+              .and_then(|error| error.get("message"))
+              .and_then(|message| message.as_str())
+              .unwrap_or("Grok health response was not successful");
+            site_sessions.push(WorkerSiteSession {
+              site: ProductionSite::Grok,
+              state: SiteSessionState::Unknown,
+              checked_at: Some(chrono::Utc::now().to_rfc3339()),
+              current_host: Some("grok.com".to_string()),
+              account_identifier: None,
+              message: Some(format!("Grok health probe failed: {message}")),
+            });
+          }
+          Err(error) => {
             grok_logged_in = Some(false);
             site_sessions.push(WorkerSiteSession {
               site: ProductionSite::Grok,
@@ -912,7 +947,7 @@ pub async fn probe_worker_health(
               checked_at: Some(chrono::Utc::now().to_rfc3339()),
               current_host: Some("grok.com".to_string()),
               account_identifier: None,
-              message: Some("Grok health probe failed or extension not responding".to_string()),
+              message: Some(format!("Grok health probe failed: {}", error.message)),
             });
           }
         }

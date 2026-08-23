@@ -468,6 +468,16 @@ impl WorkerRegistry {
       || !worker.extension_ready
       || worker.capabilities.is_empty()
     {
+      if let Some(session) = worker.site_sessions.get(&ProductionSite::Grok) {
+        if let Some(message) = session.message.as_deref() {
+          if message.contains("paid Donut Browser plan") {
+            return Err(WorkerError::new(
+              WorkerErrorCode::CapabilityUnavailable,
+              message.to_string(),
+            ));
+          }
+        }
+      }
       return Err(WorkerError::new(
         WorkerErrorCode::ExtensionUnavailable,
         "Worker extension is not ready, not connected, or has not reported capabilities",
