@@ -56,7 +56,11 @@ where
 {
   let _profile_launch_guard = lock_profile_launch(profile_id).await;
   let (url, reused) = match policy {
-    LaunchUrlPolicy::AlwaysOpen(url) => (url, false),
+    LaunchUrlPolicy::AlwaysOpen(url) => {
+      // Preserve the generic API's URL-opening behavior while reporting
+      // whether this invocation reused an already-running browser.
+      (url, check_running().await?)
+    }
     LaunchUrlPolicy::ColdStartOnly(url) => {
       if check_running().await? {
         (None, true)
@@ -1474,17 +1478,76 @@ pub async fn launch_browser_profile_impl_with_policy_result(
             headless,
           )
           .await
-          .map_err(|error| error.to_string())
+          .map_err(|error| {
+            log::info!(
+              "Browser launch failed for profile: {}, error: {}",
+              launch_profile.name,
+              error
+            );
+            #[derive(serde::Serialize)]
+            struct RunningChangedPayload {
+              id: String,
+              is_running: bool,
+            }
+            if let Err(emit_error) = events::emit(
+              "profile-running-changed",
+              &RunningChangedPayload {
+                id: launch_profile.id.to_string(),
+                is_running: false,
+              },
+            ) {
+              log::warn!("Warning: Failed to emit profile running changed event: {emit_error}");
+            }
+            let message = error.to_string();
+            if message.contains("Exec format error") {
+              format!(
+                "Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your platform.",
+                std::env::consts::ARCH
+              )
+            } else {
+              crate::wrap_backend_error(error, "Failed to launch browser or open URL")
+            }
+          })
       } else {
         browser_runner
           .launch_or_open_url(launch_app_handle, &launch_profile, launch_url, None)
           .await
-          .map_err(|error| error.to_string())
+          .map_err(|error| {
+            log::info!(
+              "Browser launch failed for profile: {}, error: {}",
+              launch_profile.name,
+              error
+            );
+            #[derive(serde::Serialize)]
+            struct RunningChangedPayload {
+              id: String,
+              is_running: bool,
+            }
+            if let Err(emit_error) = events::emit(
+              "profile-running-changed",
+              &RunningChangedPayload {
+                id: launch_profile.id.to_string(),
+                is_running: false,
+              },
+            ) {
+              log::warn!("Warning: Failed to emit profile running changed event: {emit_error}");
+            }
+            let message = error.to_string();
+            if message.contains("Exec format error") {
+              format!(
+                "Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your system architecture.",
+                std::env::consts::ARCH
+              )
+            } else {
+              crate::wrap_backend_error(error, "Failed to launch browser or open URL")
+            }
+          })
       }
     },
   )
   .await?;
   let updated_profile = launch_result;
+  let reused = if force_new { false } else { reused };
 
   log::info!(
     "Browser launch completed for profile: {} (ID: {})",
@@ -1881,6 +1944,23 @@ mod tests {
     assert!(result.1);
     assert_eq!(launch_count.load(Ordering::SeqCst), 0);
     assert_eq!(navigation_count.load(Ordering::SeqCst), 0);
+  }
+
+  #[tokio::test]
+  async fn always_open_reports_reuse_without_suppressing_navigation() {
+    let launch_url = "https://example.com".to_string();
+    let result = launch_with_url_policy(
+      &format!("always-open-{}", uuid::Uuid::new_v4()),
+      LaunchUrlPolicy::AlwaysOpen(Some(launch_url.clone())),
+      || async { Ok(true) },
+      move |url| async move {
+        assert_eq!(url.as_deref(), Some(launch_url.as_str()));
+        Ok(())
+      },
+    )
+    .await
+    .expect("generic AlwaysOpen launch should succeed");
+    assert!(result.1, "reused must reflect the live browser state");
   }
 
   #[tokio::test]

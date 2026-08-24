@@ -127,7 +127,11 @@ async fn ensure_playwright_worker(
   // Donut atomically decides whether the persisted browser PID is alive. It
   // opens Grok only on a cold start and ignores the URL when reusing a live
   // profile, avoiding the catalog/run race and duplicate tabs.
-  let run_body = serde_json::json!({ "url": "https://grok.com/imagine", "headless": false });
+  let run_body = serde_json::json!({
+    "url": "https://grok.com/imagine",
+    "headless": false,
+    "cold_start_only": true
+  });
   let run = client
     .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
     .json(&run_body)

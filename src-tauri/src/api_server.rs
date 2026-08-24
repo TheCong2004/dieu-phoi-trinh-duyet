@@ -384,6 +384,10 @@ pub struct StopRemoteResponse {
 struct RunProfileRequest {
   url: Option<String>,
   headless: Option<bool>,
+  /// Floword's worker path opts into the atomic cold-start-only policy.
+  /// Generic clients retain the historical AlwaysOpen behavior by default.
+  #[serde(default)]
+  cold_start_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2445,13 +2449,19 @@ async fn run_profile(
     .await
     .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
 
-  let initial_url = request
-    .url
-    .unwrap_or_else(|| "https://grok.com/imagine".to_string());
+  let policy = if request.cold_start_only.unwrap_or(false) {
+    crate::browser_runner::LaunchUrlPolicy::ColdStartOnly(
+      request
+        .url
+        .unwrap_or_else(|| "https://grok.com/imagine".to_string()),
+    )
+  } else {
+    crate::browser_runner::LaunchUrlPolicy::AlwaysOpen(request.url)
+  };
   let launch_result = match crate::browser_runner::launch_browser_profile_impl_with_policy_result(
     state.app_handle.clone(),
     profile.clone(),
-    crate::browser_runner::LaunchUrlPolicy::ColdStartOnly(initial_url),
+    policy,
     None,
     headless,
     false,
