@@ -7,6 +7,7 @@ use crate::proxy_manager::PROXY_MANAGER;
 use crate::wayfern_manager::{WayfernConfig, WayfernManager};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,44 @@ async fn lock_profile_launch(profile_id: &str) -> tokio::sync::OwnedMutexGuard<(
       .clone()
   };
   lock.lock_owned().await
+}
+
+#[derive(Clone, Debug)]
+pub enum LaunchUrlPolicy {
+  AlwaysOpen(Option<String>),
+  ColdStartOnly(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowordLaunchResult {
+  pub profile: BrowserProfile,
+  pub reused: bool,
+}
+
+async fn launch_with_url_policy<R, Check, CheckFuture, Launch, LaunchFuture>(
+  profile_id: &str,
+  policy: LaunchUrlPolicy,
+  check_running: Check,
+  launch: Launch,
+) -> Result<(R, bool), String>
+where
+  Check: FnOnce() -> CheckFuture,
+  CheckFuture: Future<Output = Result<bool, String>>,
+  Launch: FnOnce(Option<String>) -> LaunchFuture,
+  LaunchFuture: Future<Output = Result<R, String>>,
+{
+  let _profile_launch_guard = lock_profile_launch(profile_id).await;
+  let (url, reused) = match policy {
+    LaunchUrlPolicy::AlwaysOpen(url) => (url, false),
+    LaunchUrlPolicy::ColdStartOnly(url) => {
+      if check_running().await? {
+        (None, true)
+      } else {
+        (Some(url), false)
+      }
+    }
+  };
+  Ok((launch(url).await?, reused))
 }
 
 pub struct BrowserRunner {
@@ -1313,13 +1352,31 @@ pub async fn launch_browser_profile_impl(
   headless: bool,
   force_new: bool,
 ) -> Result<BrowserProfile, String> {
+  launch_browser_profile_impl_with_policy_result(
+    app_handle,
+    profile,
+    LaunchUrlPolicy::AlwaysOpen(url),
+    remote_debugging_port,
+    headless,
+    force_new,
+  )
+  .await
+  .map(|result| result.profile)
+}
+
+pub async fn launch_browser_profile_impl_with_policy_result(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+  policy: LaunchUrlPolicy,
+  remote_debugging_port: Option<u16>,
+  headless: bool,
+  force_new: bool,
+) -> Result<FlowordLaunchResult, String> {
   log::info!(
     "Launch request received for profile: {} (ID: {})",
     profile.name,
     profile.id
   );
-  let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
-
   if profile.is_cross_os() {
     return Err(format!(
       "Cannot launch profile '{}': this profile was created on {} and cannot be launched on a different operating system",
@@ -1387,47 +1444,47 @@ pub async fn launch_browser_profile_impl(
   // `force_new` callers (API/MCP) always start a fresh instance with the
   // requested debug port and headless mode, bypassing the "open URL in the
   // existing window" path which would otherwise ignore both.
-  let launch_result = if force_new {
-    browser_runner
-      .launch_browser_with_debugging(
-        app_handle.clone(),
-        &profile_for_launch,
-        url,
-        remote_debugging_port,
-        headless,
-      )
-      .await
-  } else {
-    browser_runner
-      .launch_or_open_url(app_handle.clone(), &profile_for_launch, url, None)
-      .await
-  };
-  let updated_profile = launch_result.map_err(|e| {
-    log::info!("Browser launch failed for profile: {}, error: {}", profile_for_launch.name, e);
-
-    // Emit a failure event to clear loading states in the frontend
-    #[derive(serde::Serialize)]
-    struct RunningChangedPayload {
-      id: String,
-      is_running: bool,
-    }
-    let payload = RunningChangedPayload {
-      id: profile_for_launch.id.to_string(),
-      is_running: false,
-    };
-
-    if let Err(e) = events::emit("profile-running-changed", &payload) {
-      log::warn!("Warning: Failed to emit profile running changed event: {e}");
-    }
-
-    // Check if this is an architecture compatibility issue
-    if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
-      if io_error.kind() == std::io::ErrorKind::Other && io_error.to_string().contains("Exec format error") {
-        return format!("Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your platform.", std::env::consts::ARCH);
+  let profile_id = profile_for_launch.id.to_string();
+  let check_app_handle = app_handle.clone();
+  let check_profile = profile_for_launch.clone();
+  let launch_app_handle = app_handle.clone();
+  let launch_profile = profile_for_launch.clone();
+  let (launch_result, reused) = launch_with_url_policy(
+    &profile_id,
+    policy,
+    || async {
+      browser_runner
+        .check_browser_status(check_app_handle, &check_profile)
+        .await
+        .map_err(|error| {
+          crate::wrap_backend_error(
+            error,
+            "Failed to check browser status before cold-start policy",
+          )
+        })
+    },
+    |launch_url| async move {
+      if force_new {
+        browser_runner
+          .launch_browser_with_debugging(
+            launch_app_handle.clone(),
+            &launch_profile,
+            launch_url,
+            remote_debugging_port,
+            headless,
+          )
+          .await
+          .map_err(|error| error.to_string())
+      } else {
+        browser_runner
+          .launch_or_open_url(launch_app_handle, &launch_profile, launch_url, None)
+          .await
+          .map_err(|error| error.to_string())
       }
-    }
-    crate::wrap_backend_error(e, "Failed to launch browser or open URL")
-  })?;
+    },
+  )
+  .await?;
+  let updated_profile = launch_result;
 
   log::info!(
     "Browser launch completed for profile: {} (ID: {})",
@@ -1481,7 +1538,10 @@ pub async fn launch_browser_profile_impl(
   // The proxy PID mapping was already reconciled inside launch_browser_internal
   // (placeholder → real browser PID); nothing is ever keyed by a constant here.
 
-  Ok(updated_profile)
+  Ok(FlowordLaunchResult {
+    profile: updated_profile,
+    reused,
+  })
 }
 
 async fn lock_vpn_pool_rotation(pool_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -1704,6 +1764,8 @@ pub async fn open_url_with_profile(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+  use tokio::sync::Barrier;
 
   #[tokio::test]
   async fn profile_launch_lock_serializes_only_the_same_profile() {
@@ -1729,6 +1791,96 @@ mod tests {
         .await
         .is_ok()
     );
+  }
+
+  #[tokio::test]
+  async fn cold_start_only_launches_once_when_two_requests_race() {
+    let profile_id = format!("cold-start-only-{}", uuid::Uuid::new_v4());
+    let browser_alive = Arc::new(AtomicBool::new(false));
+    let launch_count = Arc::new(AtomicUsize::new(0));
+    let navigation_count = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let make_request = |profile_id: String,
+                        barrier: Arc<Barrier>,
+                        browser_alive: Arc<AtomicBool>,
+                        launch_count: Arc<AtomicUsize>,
+                        navigation_count: Arc<AtomicUsize>| async move {
+      barrier.wait().await;
+      let check_alive = browser_alive.clone();
+      launch_with_url_policy(
+        &profile_id,
+        LaunchUrlPolicy::ColdStartOnly("https://grok.com/imagine".to_string()),
+        move || {
+          let alive = check_alive.load(Ordering::SeqCst);
+          async move { Ok(alive) }
+        },
+        move |url| {
+          let browser_alive = browser_alive.clone();
+          let launch_count = launch_count.clone();
+          let navigation_count = navigation_count.clone();
+          async move {
+            if url.is_some() {
+              launch_count.fetch_add(1, Ordering::SeqCst);
+              navigation_count.fetch_add(1, Ordering::SeqCst);
+              browser_alive.store(true, Ordering::SeqCst);
+              Ok(false)
+            } else {
+              Ok(true)
+            }
+          }
+        },
+      )
+      .await
+    };
+    let first = make_request(
+      profile_id.clone(),
+      barrier.clone(),
+      browser_alive.clone(),
+      launch_count.clone(),
+      navigation_count.clone(),
+    );
+    let second = make_request(
+      profile_id,
+      barrier,
+      browser_alive.clone(),
+      launch_count.clone(),
+      navigation_count.clone(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+      tokio::join!(first, second)
+    })
+    .await
+    .expect("ColdStartOnly requests must not deadlock");
+    assert_eq!(
+      result.0.unwrap().1 as usize + result.1.unwrap().1 as usize,
+      1
+    );
+    assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn cold_start_only_reuses_live_browser_without_launch_or_navigation() {
+    let browser_alive = Arc::new(AtomicBool::new(true));
+    let launch_count = Arc::new(AtomicUsize::new(0));
+    let navigation_count = Arc::new(AtomicUsize::new(0));
+    let result = launch_with_url_policy(
+      &format!("cold-start-live-{}", uuid::Uuid::new_v4()),
+      LaunchUrlPolicy::ColdStartOnly("https://grok.com/imagine".to_string()),
+      move || {
+        let alive = browser_alive.load(Ordering::SeqCst);
+        async move { Ok(alive) }
+      },
+      move |url| async move {
+        assert!(url.is_none());
+        Ok(true)
+      },
+    )
+    .await
+    .expect("live browser reuse should succeed");
+    assert!(result.1);
+    assert_eq!(launch_count.load(Ordering::SeqCst), 0);
+    assert_eq!(navigation_count.load(Ordering::SeqCst), 0);
   }
 
   #[tokio::test]

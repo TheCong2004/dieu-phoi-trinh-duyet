@@ -333,6 +333,7 @@ struct RunProfileResponse {
   browser_pid: Option<u32>,
   #[serde(skip_serializing_if = "Option::is_none")]
   launch_generation: Option<u64>,
+  reused: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2432,18 +2433,6 @@ async fn run_profile(
     .find(|p| p.id.to_string() == id)
     .ok_or((StatusCode::NOT_FOUND, "profile not found".to_string()))?;
 
-  // A persisted PID is not proof that the browser is alive. Reuse the
-  // existing browser only when the process table confirms it; otherwise this
-  // is a cold start and the requested URL is passed exactly once.
-  let browser_alive = profile
-    .process_id
-    .map(|pid| {
-      use sysinfo::{Pid, System};
-      System::new_all().process(Pid::from(pid as usize)).is_some()
-    })
-    .unwrap_or(false);
-  let url = if browser_alive { None } else { request.url };
-
   if profile.is_cross_os() {
     return Err((
       StatusCode::BAD_REQUEST,
@@ -2456,22 +2445,29 @@ async fn run_profile(
     .await
     .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
 
-  let updated_profile = match crate::browser_runner::launch_browser_profile_impl(
+  let initial_url = request
+    .url
+    .unwrap_or_else(|| "https://grok.com/imagine".to_string());
+  let launch_result = match crate::browser_runner::launch_browser_profile_impl_with_policy_result(
     state.app_handle.clone(),
     profile.clone(),
-    url,
+    crate::browser_runner::LaunchUrlPolicy::ColdStartOnly(initial_url),
     None,
     headless,
     false,
   )
   .await
   {
-    Ok(updated_profile) => updated_profile,
+    Ok(result) => result,
     Err(e) => {
       log::error!("Run profile failed: {e}");
       return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
     }
   };
+  let crate::browser_runner::FlowordLaunchResult {
+    profile: updated_profile,
+    reused,
+  } = launch_result;
   let profiles_dir = ProfileManager::instance().get_profiles_dir();
   let profile_path = updated_profile.get_profile_data_path(&profiles_dir);
   let profile_path_str = profile_path.to_string_lossy();
@@ -2486,6 +2482,7 @@ async fn run_profile(
     headless,
     browser_pid: updated_profile.process_id,
     launch_generation: updated_profile.last_launch,
+    reused,
   }))
 }
 
@@ -3242,6 +3239,23 @@ async fn check_browser_downloaded(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn run_profile_response_exposes_reused_boolean() {
+    let response = RunProfileResponse {
+      profile_id: "profile".to_string(),
+      remote_debugging_port: 9223,
+      headless: false,
+      browser_pid: Some(42),
+      launch_generation: Some(7),
+      reused: true,
+    };
+    let value = serde_json::to_value(response).expect("response should serialize");
+    assert_eq!(
+      value.get("reused").and_then(serde_json::Value::as_bool),
+      Some(true)
+    );
+  }
   use crate::profile::types::{BrowserProfile, SyncMode};
 
   fn profile_with(sync_mode: SyncMode, host_os: Option<&str>) -> BrowserProfile {
