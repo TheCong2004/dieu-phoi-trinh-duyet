@@ -334,6 +334,8 @@ pub enum WorkerErrorCode {
 pub struct WorkerError {
   pub code: WorkerErrorCode,
   pub message: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub diagnostic_code: Option<String>,
 }
 
 impl WorkerError {
@@ -341,7 +343,13 @@ impl WorkerError {
     Self {
       code,
       message: message.into(),
+      diagnostic_code: None,
     }
+  }
+
+  pub fn with_diagnostic_code(mut self, code: impl Into<String>) -> Self {
+    self.diagnostic_code = Some(code.into());
+    self
   }
 
   pub fn is_transient(&self) -> bool {
@@ -392,7 +400,10 @@ impl WorkerError {
     }
   }
 
-  pub fn code_str(&self) -> &'static str {
+  pub fn code_str(&self) -> &str {
+    if let Some(code) = self.diagnostic_code.as_deref() {
+      return code;
+    }
     match self.code {
       WorkerErrorCode::WorkerBusy => "WORKER_BUSY",
       WorkerErrorCode::NoAvailableWorker => "NO_AVAILABLE_WORKER",

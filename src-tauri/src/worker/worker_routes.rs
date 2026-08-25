@@ -111,6 +111,37 @@ fn playwright_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest:
     .build()
 }
 
+async fn preserve_http_error(
+  response: reqwest::Response,
+  fallback: WorkerErrorCode,
+  context: &str,
+) -> WorkerError {
+  let status = response.status();
+  let body = response.text().await.unwrap_or_default();
+  let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+  let error = parsed
+    .as_ref()
+    .and_then(|v| v.get("error"))
+    .unwrap_or(&serde_json::Value::Null);
+  let code = error
+    .get("code")
+    .and_then(|v| v.as_str())
+    .unwrap_or("INTERNAL_ERROR");
+  let message = error
+    .get("message")
+    .and_then(|v| v.as_str())
+    .unwrap_or(body.trim());
+  let stage = error
+    .get("stage")
+    .and_then(|v| v.as_str())
+    .unwrap_or("UNKNOWN");
+  WorkerError::new(
+    fallback,
+    format!("{context} HTTP {status}: code={code} stage={stage} message={message}"),
+  )
+  .with_diagnostic_code(code)
+}
+
 async fn ensure_playwright_worker(
   profile_id: &str,
   req: &AcquireWorkerRequest,
@@ -144,10 +175,14 @@ async fn ensure_playwright_worker(
       )
     })?;
   if !run.status().is_success() {
-    return Err(WorkerError::new(
-      WorkerErrorCode::BridgeDisconnected,
-      format!("Donut profile run failed: {}", run.status()),
-    ));
+    return Err(
+      preserve_http_error(
+        run,
+        WorkerErrorCode::BridgeDisconnected,
+        "Donut profile run failed",
+      )
+      .await,
+    );
   }
   let run_body: serde_json::Value = run.json().await.map_err(|e| {
     WorkerError::new(
@@ -199,10 +234,14 @@ async fn ensure_playwright_worker(
       )
     })?;
   if !start.status().is_success() {
-    return Err(WorkerError::new(
-      WorkerErrorCode::BridgeDisconnected,
-      format!("Playwright CDP attach failed: {}", start.status()),
-    ));
+    return Err(
+      preserve_http_error(
+        start,
+        WorkerErrorCode::BridgeDisconnected,
+        "Playwright CDP attach failed",
+      )
+      .await,
+    );
   }
   let status: serde_json::Value = client
     .get(format!("{base}/v1/profiles/{profile_id}/status"))
@@ -1782,5 +1821,6 @@ fn provider_error(
 fn map_legacy_dispatch_error(error: WorkerError) -> (StatusCode, Json<serde_json::Value>) {
   let status =
     StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-  provider_error(error.code_str(), error.message, status)
+  let code = error.code_str().to_string();
+  provider_error(&code, error.message, status)
 }

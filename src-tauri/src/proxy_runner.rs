@@ -322,6 +322,8 @@ pub async fn start_proxy_process_with_profile(
     cmd.arg("start");
     cmd.arg("--id");
     cmd.arg(&id);
+    cmd.env("DONUTBROWSER_DATA_DIR", crate::app_dirs::data_dir());
+    cmd.env("DONUTBROWSER_CACHE_DIR", crate::app_dirs::cache_dir());
     cmd.env_remove("DONUT_PROXY_USERNAME");
     cmd.env_remove("DONUT_PROXY_PASSWORD");
 
@@ -400,6 +402,8 @@ pub async fn start_proxy_process_with_profile(
     cmd.arg("start");
     cmd.arg("--id");
     cmd.arg(&id);
+    cmd.env("DONUTBROWSER_DATA_DIR", crate::app_dirs::data_dir());
+    cmd.env("DONUTBROWSER_CACHE_DIR", crate::app_dirs::cache_dir());
     cmd.env_remove("DONUT_PROXY_USERNAME");
     cmd.env_remove("DONUT_PROXY_PASSWORD");
 

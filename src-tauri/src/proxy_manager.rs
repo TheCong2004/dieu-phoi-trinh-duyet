@@ -219,6 +219,38 @@ pub struct ProxyManager {
   dead_browser_misses: Mutex<HashMap<u32, u8>>,
 }
 
+#[derive(Debug)]
+pub enum ProxyPidBindingError {
+  InvalidBrowserPid,
+  ProfileProxyMappingMissing {
+    profile_id: String,
+    browser_pid: u32,
+  },
+  ActiveProxyConfigMissing {
+    proxy_id: String,
+    profile_id: String,
+    browser_pid: u32,
+  },
+  ProxyConfigPersistFailed {
+    proxy_id: String,
+    profile_id: String,
+    browser_pid: u32,
+  },
+}
+
+impl std::fmt::Display for ProxyPidBindingError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::InvalidBrowserPid => write!(f, "INVALID_BROWSER_PID"),
+      Self::ProfileProxyMappingMissing { profile_id, browser_pid } => write!(f, "PROFILE_PROXY_MAPPING_MISSING: profile_id={profile_id} browser_pid={browser_pid}"),
+      Self::ActiveProxyConfigMissing { proxy_id, profile_id, browser_pid } => write!(f, "ACTIVE_PROXY_CONFIG_MISSING: profile_id={profile_id} proxy_id={proxy_id} browser_pid={browser_pid}"),
+      Self::ProxyConfigPersistFailed { proxy_id, profile_id, browser_pid } => write!(f, "PROXY_CONFIG_PERSIST_FAILED: profile_id={profile_id} proxy_id={proxy_id} browser_pid={browser_pid}"),
+    }
+  }
+}
+
+impl std::error::Error for ProxyPidBindingError {}
+
 impl ProxyManager {
   pub fn new() -> Self {
     let manager = Self {
@@ -1715,6 +1747,14 @@ impl ProxyManager {
       .arg("proxy")
       .arg("start");
 
+    // Keep the short-lived sidecar and the detached proxy worker on the same
+    // storage roots as the Donut runtime. Without explicit roots, a debug
+    // runtime and a release sidecar can resolve different app names
+    // (DonutBrowserDev vs DonutBrowser) and lose the active proxy config.
+    proxy_cmd = proxy_cmd
+      .env("DONUTBROWSER_DATA_DIR", crate::app_dirs::data_dir())
+      .env("DONUTBROWSER_CACHE_DIR", crate::app_dirs::cache_dir());
+
     // Add upstream proxy settings if provided, otherwise create direct proxy
     if let Some(proxy_settings) = proxy_settings {
       proxy_cmd = proxy_cmd
@@ -2006,9 +2046,13 @@ impl ProxyManager {
   /// path — it simply rewrites `browser_pid` to the new live PID. A `browser_pid`
   /// of 0 (launch failed to report a PID) is rejected so the caller can abort
   /// the launch instead of leaving a worker without a verified browser owner.
-  pub fn set_browser_pid_for_profile(&self, profile_id: &str, browser_pid: u32) -> bool {
+  pub fn set_browser_pid_for_profile(
+    &self,
+    profile_id: &str,
+    browser_pid: u32,
+  ) -> Result<(), ProxyPidBindingError> {
     if browser_pid == 0 {
-      return false;
+      return Err(ProxyPidBindingError::InvalidBrowserPid);
     }
     let proxy_id = {
       let map = self.profile_active_proxy_ids.lock().unwrap();
@@ -2026,20 +2070,35 @@ impl ProxyManager {
         .map(|proxy| proxy.id.clone())
     });
     let Some(proxy_id) = proxy_id else {
-      log::warn!("No active proxy found for profile {profile_id} while recording browser PID {browser_pid}");
-      return false;
+      log::warn!(
+        "No active proxy found for profile {profile_id} while recording browser PID {browser_pid}"
+      );
+      return Err(ProxyPidBindingError::ProfileProxyMappingMissing {
+        profile_id: profile_id.to_string(),
+        browser_pid,
+      });
     };
     let Some(mut cfg) = crate::proxy_storage::get_proxy_config(&proxy_id) else {
-      log::warn!("Active proxy config {proxy_id} is unavailable while recording browser PID {browser_pid}");
-      return false;
+      log::warn!(
+        "Active proxy config {proxy_id} is unavailable while recording browser PID {browser_pid}"
+      );
+      return Err(ProxyPidBindingError::ActiveProxyConfigMissing {
+        proxy_id,
+        profile_id: profile_id.to_string(),
+        browser_pid,
+      });
     };
     cfg.browser_pid = Some(browser_pid);
     if crate::proxy_storage::update_proxy_config(&cfg) {
       log::info!("Recorded browser PID {browser_pid} on proxy config {proxy_id} for self-reaping");
-      true
+      Ok(())
     } else {
       log::warn!("Failed to persist browser_pid {browser_pid} to proxy config {proxy_id}");
-      false
+      Err(ProxyPidBindingError::ProxyConfigPersistFailed {
+        proxy_id,
+        profile_id: profile_id.to_string(),
+        browser_pid,
+      })
     }
   }
 

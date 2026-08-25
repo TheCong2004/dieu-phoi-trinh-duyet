@@ -2471,7 +2471,7 @@ async fn run_profile(
     Ok(result) => result,
     Err(e) => {
       log::error!("Run profile failed: {e}");
-      return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+      return Err(profile_launch_error_response(&id, e));
     }
   };
   let crate::browser_runner::FlowordLaunchResult {
@@ -2494,6 +2494,49 @@ async fn run_profile(
     launch_generation: updated_profile.last_launch,
     reused,
   }))
+}
+
+fn profile_launch_error_response(profile_id: &str, raw: String) -> (StatusCode, String) {
+  let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
+  let code = parsed
+    .as_ref()
+    .and_then(|v| v.get("code"))
+    .and_then(|v| v.as_str())
+    .or_else(|| raw.split(':').next())
+    .unwrap_or("INTERNAL_ERROR")
+    .to_string();
+  let detail = parsed
+    .as_ref()
+    .and_then(|v| v.get("params"))
+    .and_then(|v| v.get("detail"))
+    .and_then(|v| v.as_str())
+    .unwrap_or_else(|| raw.trim());
+  let stage = match code.as_str() {
+    "PROXY_BROWSER_PID_BIND_FAILED" => "PROXY_BROWSER_PID_BIND",
+    "PROXY_START_FAILED" | "XRAY_START_FAILED" => "PROXY_START",
+    "WAYFERN_LAUNCH_FAILED" => "WAYFERN_LAUNCH",
+    "PROFILE_PROCESS_PERSIST_FAILED" => "PROFILE_PROCESS_PERSIST",
+    _ => "PROFILE_LAUNCH",
+  };
+  let status = match code.as_str() {
+    "PROFILE_RUNNING" | "PROFILE_LAUNCH_IN_PROGRESS" => StatusCode::CONFLICT,
+    "PROXY_START_FAILED" | "PROXY_BROWSER_PID_BIND_FAILED" => StatusCode::SERVICE_UNAVAILABLE,
+    _ => StatusCode::INTERNAL_SERVER_ERROR,
+  };
+  let retryable = matches!(
+    status,
+    StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+  );
+  let body = serde_json::json!({
+    "error": {
+      "code": code,
+      "message": detail,
+      "stage": stage,
+      "profileId": profile_id,
+      "retryable": retryable
+    }
+  });
+  (status, body.to_string())
 }
 
 // API Handler - Launch this profile on a REMOTE VM of its own operating system

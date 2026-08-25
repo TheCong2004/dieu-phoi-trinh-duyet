@@ -627,11 +627,15 @@ impl BrowserRunner {
         crate::vpn::pool::monitor_profile_lease(profile.id.to_string(), process_id);
         pool_lease_launch_guard.armed = false;
       }
-      if !PROXY_MANAGER.set_browser_pid_for_profile(&updated_profile.id.to_string(), process_id) {
+      if let Err(error) =
+        PROXY_MANAGER.set_browser_pid_for_profile(&updated_profile.id.to_string(), process_id)
+      {
         if let Err(error) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
           log::warn!("Failed to stop Wayfern after proxy worker reassignment failed: {error}");
         }
-        return Err(crate::backend_error("INTERNAL_ERROR").into());
+        return Err(
+          crate::backend_error_with_detail("PROXY_BROWSER_PID_BIND_FAILED", error).into(),
+        );
       }
       if let Some(worker_id) = xray_launch_guard.worker_id.as_deref() {
         if !crate::xray_worker_runner::set_browser_pid(worker_id, process_id) {
