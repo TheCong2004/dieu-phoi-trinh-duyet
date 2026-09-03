@@ -483,8 +483,8 @@
       "latestDownloading": "Baixando versão ({{version}})...",
       "upgradeAvailable": "Uma versão mais recente ({{version}}) do {{browser}} está disponível."
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "Desenvolvido com Wayfern",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "Navegador local gratuito",
     "platformUnavailable": "{{browser}} ainda não está disponível para sua plataforma.",
     "passwordProtect": {
       "label": "Proteger este perfil com senha",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Não foi possível iniciar o Xray-core."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "Perfis",
     "extensions": "Extensões",
     "groups": "Grupos",
@@ -1977,11 +1975,10 @@
     },
     "network": "Rede",
     "integrations": "Integrações",
-    "account": "Conta"
+    "account": "Conta",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "Rede",
     "extensions": "Extensões",
     "groups": "Grupos",
@@ -1990,7 +1987,8 @@
     "integrations": "Integrações",
     "account": "Conta",
     "import": "Importar perfil",
-    "shortcuts": "Atalhos de teclado"
+    "shortcuts": "Atalhos de teclado",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

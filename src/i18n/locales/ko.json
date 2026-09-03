@@ -483,8 +483,8 @@
       "latestDownloading": "버전 ({{version}})을 다운로드하는 중...",
       "upgradeAvailable": "{{browser}}의 최신 버전({{version}})을 사용할 수 있습니다."
     },
-    "chromiumLabel": "크로미움",
-    "chromiumSubtitle": "Wayfern 기반",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "로컬 무료 브라우저",
     "platformUnavailable": "{{browser}}는 아직 이 플랫폼에서 사용할 수 없습니다.",
     "passwordProtect": {
       "label": "이 프로필을 비밀번호로 보호",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Xray-core를 시작할 수 없습니다."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "프로필",
     "extensions": "확장 프로그램",
     "groups": "그룹",
@@ -1977,11 +1975,10 @@
     },
     "network": "네트워크",
     "integrations": "통합",
-    "account": "계정"
+    "account": "계정",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "네트워크",
     "extensions": "확장 프로그램",
     "groups": "그룹",
@@ -1990,7 +1987,8 @@
     "integrations": "통합",
     "account": "계정",
     "import": "프로필 가져오기",
-    "shortcuts": "키보드 단축키"
+    "shortcuts": "키보드 단축키",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

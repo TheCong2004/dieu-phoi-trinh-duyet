@@ -170,8 +170,10 @@ export function WelcomeDialog({
 
   // Track the required browser's download + extraction the whole time the
   // dialog is open, so progress is live by the time the user reaches setup.
-  const setup = useBrowserSetup("wayfern", isOpen);
-  const browserName = getBrowserDisplayName("wayfern");
+  // The current product ships only the local Chrome for Testing runtime.
+  // Legacy Wayfern profiles remain readable, but are never part of setup.
+  const setup = useBrowserSetup("chromium", isOpen);
+  const browserName = getBrowserDisplayName("chromium");
 
   const requestPermissions = useCallback(async () => {
     setRequesting(true);

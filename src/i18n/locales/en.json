@@ -483,8 +483,8 @@
       "latestDownloading": "Downloading version ({{version}})...",
       "upgradeAvailable": "A newer version ({{version}}) of {{browser}} is available."
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "Powered by Wayfern",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "Local free browser",
     "platformUnavailable": "{{browser}} is not available on your platform yet.",
     "passwordProtect": {
       "label": "Password protect this profile",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Xray-core could not start."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "Profiles",
     "extensions": "Extensions",
     "groups": "Groups",
@@ -1977,11 +1975,10 @@
     },
     "network": "Network",
     "integrations": "Integrations",
-    "account": "Account"
+    "account": "Account",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "Network",
     "extensions": "Extensions",
     "groups": "Groups",
@@ -1991,6 +1988,7 @@
     "account": "Account",
     "import": "Import profile",
     "shortcuts": "Keyboard shortcuts",
+    "tasks": "Tasks",
     "capcutpolot": "CapCutPolot Agent"
   },
   "encryption": {

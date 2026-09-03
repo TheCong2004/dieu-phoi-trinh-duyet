@@ -885,8 +885,11 @@ impl ExtensionManager {
     profile: &crate::profile::BrowserProfile,
     _profile_data_path: &std::path::Path,
   ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    // --load-extension is Chromium-only, and only Wayfern is launched with it.
-    if profile.browser.as_str() != "wayfern" {
+    // --load-extension is supported by Chromium-based engines, including the
+    // dedicated Chrome for Testing runtime used by Floword. Keep the bundled
+    // production extension available for both engines; otherwise the
+    // Chromium launch path would silently omit the extension arguments.
+    if !matches!(profile.browser.as_str(), "wayfern" | "chromium") {
       return Ok(Vec::new());
     }
 

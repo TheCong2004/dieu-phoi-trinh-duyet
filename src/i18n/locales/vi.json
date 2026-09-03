@@ -483,8 +483,8 @@
       "latestDownloading": "Đang tải xuống phiên bản ({{version}})...",
       "upgradeAvailable": "Đã có phiên bản mới hơn ({{version}}) của {{browser}}."
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "Dựa trên Wayfern",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "Trình duyệt cục bộ miễn phí",
     "platformUnavailable": "{{browser}} chưa khả dụng trên nền tảng của bạn.",
     "passwordProtect": {
       "label": "Bảo vệ hồ sơ bằng mật khẩu",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Không thể khởi động Xray-core."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "Profile",
     "extensions": "Tiện ích",
     "groups": "Nhóm",
@@ -1977,11 +1975,10 @@
     },
     "network": "Mạng",
     "integrations": "Tích hợp",
-    "account": "Tài khoản"
+    "account": "Tài khoản",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "Mạng",
     "extensions": "Tiện ích",
     "groups": "Nhóm",
@@ -1991,6 +1988,7 @@
     "account": "Tài khoản",
     "import": "Nhập profile",
     "shortcuts": "Phím tắt",
+    "tasks": "Tasks",
     "capcutpolot": "CapCutPolot Agent"
   },
   "encryption": {

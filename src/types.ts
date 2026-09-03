@@ -43,6 +43,8 @@ export interface BrowserProfile {
   created_at?: number;
   dns_blocklist?: string;
   password_protected?: boolean;
+  /** True for preserved Wayfern profiles that are read-only legacy data. */
+  legacy_unsupported?: boolean;
 }
 
 export interface Extension {

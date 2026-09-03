@@ -216,6 +216,13 @@ impl ProfileManager {
           clear_on_close: false,
           created_at: None,
           updated_at: None,
+          managed_grok_marker_version: None,
+          managed_grok_marker_id: None,
+          managed_grok_marker_created_at: None,
+          managed_grok_target_id: None,
+          managed_grok_browser_pid: None,
+          managed_grok_cdp_port: None,
+          managed_grok_launch_generation: None,
         };
 
         match self
@@ -308,6 +315,13 @@ impl ProfileManager {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      managed_grok_marker_version: None,
+      managed_grok_marker_id: None,
+      managed_grok_marker_created_at: None,
+      managed_grok_target_id: None,
+      managed_grok_browser_pid: None,
+      managed_grok_cdp_port: None,
+      managed_grok_launch_generation: None,
     };
 
     // Save profile info
@@ -1058,6 +1072,13 @@ impl ProfileManager {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      managed_grok_marker_version: None,
+      managed_grok_marker_id: None,
+      managed_grok_marker_created_at: None,
+      managed_grok_target_id: None,
+      managed_grok_browser_pid: None,
+      managed_grok_cdp_port: None,
+      managed_grok_launch_generation: None,
     };
 
     // Donut: a clone must NOT be linkable to its source. The source
@@ -1882,27 +1903,17 @@ pub async fn create_browser_profile_new(
   release_type: String,
   proxy_id: Option<String>,
   vpn_id: Option<String>,
-  wayfern_config: Option<WayfernConfig>,
+  _wayfern_config: Option<WayfernConfig>,
   group_id: Option<String>,
   ephemeral: Option<bool>,
   dns_blocklist: Option<String>,
   launch_hook: Option<String>,
 ) -> Result<BrowserProfile, String> {
-  let fingerprint_os = wayfern_config.as_ref().and_then(|c| c.os.as_deref());
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(fingerprint_os)
-    .await
-  {
-    return Err("Fingerprint OS spoofing requires an active Pro subscription".to_string());
-  }
-
-  // A dead/unreachable proxy or VPN (or a 402 from an expired proxy
-  // subscription) cancels creation with a translatable error.
-  crate::validate_profile_network(proxy_id.as_deref(), vpn_id.as_deref()).await?;
-
   let browser_type =
     BrowserType::from_str(&browser_str).map_err(|e| format!("Invalid browser type: {e}"))?;
+  if browser_type != BrowserType::Chromium {
+    return Err("Local Free profile creation requires Chrome for Testing (chromium)".to_string());
+  }
   create_browser_profile_with_group(
     app_handle,
     name,
@@ -1911,7 +1922,7 @@ pub async fn create_browser_profile_new(
     release_type,
     proxy_id,
     vpn_id,
-    wayfern_config,
+    None,
     group_id,
     ephemeral.unwrap_or(false),
     dns_blocklist,

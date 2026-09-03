@@ -483,8 +483,8 @@
       "latestDownloading": "Sürüm ({{version}}) indiriliyor...",
       "upgradeAvailable": "{{browser}} tarayıcısının daha yeni bir sürümü ({{version}}) mevcut."
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "Wayfern tarafından desteklenir",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "Yerel ücretsiz tarayıcı",
     "platformUnavailable": "{{browser}} henüz platformunuzda kullanılamıyor.",
     "passwordProtect": {
       "label": "Bu profili parolayla koru",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Xray-core başlatılamadı."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "Profiller",
     "extensions": "Uzantılar",
     "groups": "Gruplar",
@@ -1977,11 +1975,10 @@
     },
     "network": "Ağ",
     "integrations": "Entegrasyonlar",
-    "account": "Hesap"
+    "account": "Hesap",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "Ağ",
     "extensions": "Uzantılar",
     "groups": "Gruplar",
@@ -1990,7 +1987,8 @@
     "integrations": "Entegrasyonlar",
     "account": "Hesap",
     "import": "Profil içe aktar",
-    "shortcuts": "Klavye kısayolları"
+    "shortcuts": "Klavye kısayolları",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

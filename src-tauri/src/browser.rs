@@ -16,21 +16,44 @@ pub struct ProxySettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BrowserType {
   Wayfern,
+  Chromium,
 }
 
 impl BrowserType {
   pub fn as_str(&self) -> &'static str {
     match self {
       BrowserType::Wayfern => "wayfern",
+      BrowserType::Chromium => "chromium",
+    }
+  }
+
+  /// Stable API name for the dedicated, unbranded Chromium engine used by
+  /// Floword automation.  Keep `as_str()` as the persisted profile value
+  /// (`chromium`) for backwards compatibility.
+  pub fn canonical_engine_name(&self) -> &'static str {
+    match self {
+      BrowserType::Wayfern => "WAYFERN",
+      BrowserType::Chromium => "CHROME_FOR_TESTING",
     }
   }
 
   pub fn from_str(s: &str) -> Result<Self, String> {
-    match s {
+    match s.trim().to_ascii_lowercase().as_str() {
       "wayfern" => Ok(BrowserType::Wayfern),
+      "chromium" | "chrome_for_testing" | "chrome-for-testing" => Ok(BrowserType::Chromium),
       _ => Err(format!("Unknown browser type: {s}")),
     }
   }
+}
+
+/// Returns true for all accepted aliases of the dedicated Floword Chromium
+/// engine.  Google Chrome/Edge paths are rejected separately by executable
+/// resolution and are never treated as this engine.
+pub fn is_chrome_for_testing_alias(value: &str) -> bool {
+  matches!(
+    value.trim().to_ascii_lowercase().as_str(),
+    "chromium" | "chrome_for_testing" | "chrome-for-testing"
+  )
 }
 
 #[allow(dead_code)]
@@ -258,6 +281,102 @@ mod windows {
 /// Wayfern is a Chromium-based anti-detect browser with CDP-based fingerprint injection
 pub struct WayfernBrowser;
 
+/// System Chromium/Chrome used exclusively by Floword CDP workers. Unlike
+/// Wayfern this engine has no paid CDP restrictions and is never selected for
+/// regular Donut profiles.
+pub struct ChromiumBrowser;
+
+impl ChromiumBrowser {
+  pub fn new() -> Self {
+    Self
+  }
+
+  pub fn resolve_executable() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("FLOWORD_CHROMIUM_EXECUTABLE") {
+      candidates.push(PathBuf::from(path));
+    }
+    for variable in ["FLOWORD_CHROMIUM_SOURCE_DIR", "FLOWORD_CHROMIUM_DIR"] {
+      if let Ok(root) = std::env::var(variable) {
+        let root = PathBuf::from(root);
+        candidates.push(root.join("chrome-win64").join("chrome.exe"));
+        candidates.push(root.join("chrome.exe"));
+      }
+    }
+    if let Ok(root) = std::env::var("FLOWORD_DONUT_RESOURCE_ROOT") {
+      candidates.push(PathBuf::from(root).join(r"floword-chromium\chrome-win64\chrome.exe"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+      for base in exe.ancestors() {
+        candidates.push(base.join(r"resources\floword-chromium\chrome-win64\chrome.exe"));
+        candidates.push(base.join(r"resources\playwright\chrome-win64\chrome.exe"));
+      }
+    }
+    let path = candidates
+      .into_iter()
+      .find(|path| path.is_file())
+      .ok_or_else(|| {
+        std::io::Error::new(
+          std::io::ErrorKind::NotFound,
+          "FLOWORD_CHROMIUM_EXECUTABLE_NOT_FOUND",
+        )
+      })?;
+    let normalized = path.to_string_lossy().to_ascii_lowercase();
+    if normalized.contains("google\\chrome\\application") || normalized.ends_with("\\msedge.exe") {
+      return Err(std::io::Error::other("EXTENSION_COMMAND_LINE_LOAD_UNSUPPORTED").into());
+    }
+    Ok(path)
+  }
+}
+
+impl Browser for ChromiumBrowser {
+  fn get_executable_path(
+    &self,
+    _install_dir: &Path,
+  ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Self::resolve_executable()
+  }
+
+  fn create_launch_args(
+    &self,
+    profile_path: &str,
+    proxy_settings: Option<&ProxySettings>,
+    url: Option<String>,
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+  ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut args = vec![
+      format!("--user-data-dir={profile_path}"),
+      "--no-first-run".into(),
+      "--no-default-browser-check".into(),
+    ];
+    if let Some(port) = remote_debugging_port {
+      args.push("--remote-debugging-address=127.0.0.1".into());
+      args.push(format!("--remote-debugging-port={port}"));
+    }
+    if headless {
+      args.push("--headless=new".into());
+    }
+    if let Some(proxy) = proxy_settings {
+      args.push(format!(
+        "--proxy-server=http://{}:{}",
+        proxy.host, proxy.port
+      ));
+    }
+    if let Some(url) = url {
+      args.push(url);
+    }
+    Ok(args)
+  }
+
+  fn is_version_downloaded(&self, _version: &str, _binaries_dir: &Path) -> bool {
+    Self::resolve_executable().is_ok()
+  }
+  fn prepare_executable(&self, _executable_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+  }
+}
+
 impl WayfernBrowser {
   pub fn new() -> Self {
     Self
@@ -376,6 +495,7 @@ impl BrowserFactory {
   pub fn create_browser(&self, browser_type: BrowserType) -> Box<dyn Browser> {
     match browser_type {
       BrowserType::Wayfern => Box::new(WayfernBrowser::new()),
+      BrowserType::Chromium => Box::new(ChromiumBrowser::new()),
     }
   }
 }
@@ -604,6 +724,24 @@ mod tests {
   }
 
   #[test]
+  fn chrome_for_testing_aliases_canonicalize_without_accepting_branded_names() {
+    for alias in [
+      "chromium",
+      "chrome_for_testing",
+      "CHROME_FOR_TESTING",
+      "chrome-for-testing",
+    ] {
+      let engine = BrowserType::from_str(alias).expect("CFT alias should be accepted");
+      assert_eq!(engine, BrowserType::Chromium);
+      assert_eq!(engine.canonical_engine_name(), "CHROME_FOR_TESTING");
+      assert!(is_chrome_for_testing_alias(alias));
+    }
+    assert!(!is_chrome_for_testing_alias("chrome"));
+    assert!(!is_chrome_for_testing_alias("google_chrome"));
+    assert!(BrowserType::from_str("chrome").is_err());
+  }
+
+  #[test]
   fn test_wayfern_config_has_no_executable_path() {
     // Verify WayfernConfig does not store executable_path
     let config = crate::wayfern_manager::WayfernConfig::default();
@@ -648,6 +786,13 @@ mod tests {
       clear_on_close: false,
       created_at: None,
       updated_at: None,
+      managed_grok_marker_version: None,
+      managed_grok_marker_id: None,
+      managed_grok_marker_created_at: None,
+      managed_grok_target_id: None,
+      managed_grok_browser_pid: None,
+      managed_grok_cdp_port: None,
+      managed_grok_launch_generation: None,
     };
 
     let path = profile.get_profile_data_path(&profiles_dir);

@@ -64,7 +64,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { ProBadge } from "@/components/ui/pro-badge";
 import {
   Table,
   TableBody,
@@ -2206,7 +2205,9 @@ export function ProfilesDataTable({
             );
           }
 
-          const browserName = getBrowserDisplayName(browser);
+          const browserName = profile.legacy_unsupported
+            ? "Legacy unsupported"
+            : getBrowserDisplayName(browser);
 
           if (meta.showCheckboxes || isSelected) {
             return (
@@ -3435,42 +3436,24 @@ export function ProfilesDataTable({
       <DataTableActionBar table={table}>
         <DataTableActionBarSelection table={table} />
         {onBulkRun && (
-          <span className="relative inline-flex">
-            <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.runSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkRun : undefined}
-              disabled={!bulkActionsUnlocked}
-              size="icon"
-            >
-              <LuPlay className="fill-current" />
-            </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
-          </span>
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.runSelected")}
+            onClick={onBulkRun}
+            disabled={!bulkActionsUnlocked}
+            size="icon"
+          >
+            <LuPlay className="fill-current" />
+          </DataTableActionBarAction>
         )}
         {onBulkStop && (
-          <span className="relative inline-flex">
-            <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.stopSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkStop : undefined}
-              disabled={!bulkActionsUnlocked}
-              size="icon"
-            >
-              <LuSquare className="fill-current" />
-            </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
-          </span>
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.stopSelected")}
+            onClick={onBulkStop}
+            disabled={!bulkActionsUnlocked}
+            size="icon"
+          >
+            <LuSquare className="fill-current" />
+          </DataTableActionBarAction>
         )}
         {onBulkGroupAssignment && (
           <DataTableActionBarAction

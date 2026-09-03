@@ -185,6 +185,9 @@ impl Downloader {
 
         Ok(download_url)
       }
+      BrowserType::Chromium => {
+        Err("System Chromium is managed externally and is not downloaded by Donut".into())
+      }
     }
   }
 

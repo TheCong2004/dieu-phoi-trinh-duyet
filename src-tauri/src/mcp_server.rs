@@ -2400,10 +2400,10 @@ impl McpServer {
         message: "Missing browser".to_string(),
       })?;
 
-    if browser != "wayfern" {
+    if browser != "chromium" {
       return Err(McpError {
         code: -32602,
-        message: "browser must be 'wayfern'".to_string(),
+        message: "new profiles must use browser 'chromium'".to_string(),
       });
     }
 
@@ -2428,13 +2428,9 @@ impl McpServer {
       })
     });
 
-    // Pick the latest downloaded version for this browser
-    let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
-    let versions = registry.get_downloaded_versions(browser);
-    let version = versions.first().ok_or_else(|| McpError {
-      code: -32000,
-      message: format!("No downloaded version found for {browser}. Download it first."),
-    })?;
+    // Local Free uses the staged CFT runtime; no cloud/Wayfern download is
+    // consulted for profile creation.
+    let version = "staged";
 
     let inner = self.inner.lock().await;
     let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {

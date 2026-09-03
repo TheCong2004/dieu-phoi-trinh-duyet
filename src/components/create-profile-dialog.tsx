@@ -11,7 +11,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { GoPlus } from "react-icons/go";
-import { LuCheck, LuChevronsUpDown, LuLoaderCircle } from "react-icons/lu";
+import { LuCheck, LuChevronsUpDown, LuGlobe, LuLoaderCircle } from "react-icons/lu";
 import { LoadingButton } from "@/components/loading-button";
 import { ProxyFormDialog } from "@/components/proxy-form-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -67,7 +67,7 @@ const getCurrentOS = (): WayfernOS => {
 
 import { RippleButton } from "./ui/ripple";
 
-type BrowserTypeString = "wayfern";
+type BrowserTypeString = "wayfern" | "chromium";
 
 interface CreateProfileDialogProps {
   isOpen: boolean;
@@ -98,8 +98,8 @@ interface BrowserOption {
 
 const browserOptions: BrowserOption[] = [
   {
-    value: "wayfern",
-    label: "Wayfern",
+    value: "chromium",
+    label: "Chrome for Testing (local)",
   },
 ];
 
@@ -114,22 +114,22 @@ export function CreateProfileDialog({
   const proxyListboxIdAntiDetect = useId();
   const proxyListboxIdRegular = useId();
   const [profileName, setProfileName] = useState("");
-  // Only Wayfern profiles can be created, so the dialog opens straight into
-  // the Wayfern config step (no browser-selection screen).
+  // Local Free creates Chrome for Testing profiles. Legacy Wayfern profiles
+  // remain readable, but are not offered as a creation option.
   const [currentStep, setCurrentStep] = useState<
     "browser-selection" | "browser-config"
-  >("browser-config");
+  >("browser-selection");
   const [activeTab, setActiveTab] = useState("anti-detect");
 
-  // Browser selection states. Defaults to Wayfern — the only creatable browser.
+  // Browser selection state. CFT is the only creatable engine.
   const [selectedBrowser, setSelectedBrowser] =
-    useState<BrowserTypeString>("wayfern");
+    useState<BrowserTypeString>("chromium");
   const [selectedProxyId, setSelectedProxyId] = useState<string>();
   const [proxyPopoverOpen, setProxyPopoverOpen] = useState(false);
   const [dnsBlocklist, setDnsBlocklist] = useState<string>("");
   const [launchHook, setLaunchHook] = useState("");
 
-  // Wayfern anti-detect states
+  // Legacy compatibility state; never used for new Local Free profiles.
   const [wayfernConfig, setWayfernConfig] = useState<WayfernConfig>(() => ({
     os: getCurrentOS(), // Default to current OS
   }));
@@ -140,9 +140,9 @@ export function CreateProfileDialog({
     setCurrentStep("browser-config");
   };
 
-  // Reset the form fields without leaving the Wayfern config step.
+  // Reset the form fields while keeping the Local Free flow selected.
   const resetForm = () => {
-    setSelectedBrowser("wayfern");
+    setSelectedBrowser("chromium");
     setProfileName("");
     setSelectedProxyId(undefined);
     setLaunchHook("");
@@ -286,29 +286,17 @@ export function CreateProfileDialog({
   useEffect(() => {
     if (isOpen) {
       void loadSupportedBrowsers();
-      // Load downloaded Wayfern versions up front so the availability gate is accurate.
-      void loadDownloadedVersions("wayfern");
-      // Load release types when a browser is selected
-      if (selectedBrowser) {
-        void loadReleaseTypes(selectedBrowser);
-      }
-      // Wayfern needs the GeoIP database for fingerprint generation.
-      if (selectedBrowser === "wayfern") {
-        void checkAndDownloadGeoIPDatabase();
-      }
+      // CFT is staged locally; no cloud/Wayfern download is needed.
     }
   }, [
     isOpen,
     loadSupportedBrowsers,
-    loadReleaseTypes,
-    loadDownloadedVersions,
-    checkAndDownloadGeoIPDatabase,
     selectedBrowser,
   ]);
 
   // Load release types when browser selection changes
   useEffect(() => {
-    if (selectedBrowser) {
+    if (selectedBrowser && selectedBrowser !== "chromium") {
       // Cancel any previous loading
       loadingBrowserRef.current = null;
       // Clear previous release types immediately to prevent showing stale data
@@ -332,6 +320,9 @@ export function CreateProfileDialog({
 
   const getCreatableVersion = useCallback(
     (browserType?: string) => {
+      if (browserType === "chromium") {
+        return { version: "staged", releaseType: "stable" as const };
+      }
       const bestVersion = getBestAvailableVersion(browserType);
       if (bestVersion && isVersionDownloaded(bestVersion.version)) {
         return bestVersion;
@@ -393,8 +384,8 @@ export function CreateProfileDialog({
         ? password
         : undefined;
     try {
-      if (activeTab === "anti-detect") {
-        // Only Wayfern anti-detect profiles are created.
+      if (activeTab === "anti-detect" && selectedBrowser === "wayfern") {
+        // Wayfern anti-detect profiles retain their existing creation path.
         const bestWayfernVersion = getCreatableVersion("wayfern");
         if (!bestWayfernVersion) {
           console.error("No Wayfern version available");
@@ -429,7 +420,7 @@ export function CreateProfileDialog({
           return;
         }
 
-        // Use the latest available Wayfern version
+        // Use the staged CFT version.
         const bestVersion = getCreatableVersion(selectedBrowser);
         if (!bestVersion) {
           console.error("No version available");
@@ -441,7 +432,8 @@ export function CreateProfileDialog({
           browserStr: selectedBrowser,
           version: bestVersion.version,
           releaseType: bestVersion.releaseType,
-          proxyId: selectedProxyId,
+          proxyId: resolvedProxyId,
+          vpnId: resolvedVpnId,
           groupId:
             selectedGroupId && selectedGroupId !== "__all__"
               ? selectedGroupId
@@ -464,11 +456,11 @@ export function CreateProfileDialog({
     // Cancel any ongoing loading
     loadingBrowserRef.current = null;
 
-    // Reset all states. Stay on the Wayfern config step.
+    // Reset all states and return to engine selection.
     setProfileName("");
-    setCurrentStep("browser-config");
+    setCurrentStep("browser-selection");
     setActiveTab("anti-detect");
-    setSelectedBrowser("wayfern");
+    setSelectedBrowser("chromium");
     setSelectedProxyId(undefined);
     setLaunchHook("");
     setReleaseTypes({});
@@ -553,40 +545,28 @@ export function CreateProfileDialog({
                     <TabsContent value="anti-detect" className="mt-0 space-y-6">
                       {/* Anti-Detect Browser Selection */}
                       <div className="space-y-3 pt-8">
-                        {/* Wayfern (Chromium) - First */}
                         <Button
-                          onClick={() => {
-                            handleBrowserSelect("wayfern");
-                          }}
-                          disabled={!getCreatableVersion("wayfern")}
+                          onClick={() => handleBrowserSelect("chromium")}
+                          disabled={!getCreatableVersion("chromium")}
                           className="flex h-16 w-full items-center justify-start gap-3 border-2 p-4 transition-colors hover:border-primary/50"
                           variant="outline"
                         >
-                          <div className="flex size-8 items-center justify-center">
-                            {isBrowserCurrentlyDownloading("wayfern") ? (
-                              <LuLoaderCircle className="size-6 animate-spin" />
-                            ) : (
-                              (() => {
-                                const IconComponent = getBrowserIcon("wayfern");
-                                return IconComponent ? (
-                                  <IconComponent className="size-6" />
-                                ) : null;
-                              })()
-                            )}
+                          <div className="flex size-8 items-center justify-center text-primary">
+                            <LuGlobe className="size-6" />
                           </div>
                           <div className="text-left">
                             <div className="font-medium">
                               {t("createProfile.chromiumLabel")}
                             </div>
                             <div className="text-sm text-muted-foreground">
-                              {isBrowserCurrentlyDownloading("wayfern")
+                              {isBrowserCurrentlyDownloading("chromium")
                                 ? t("createProfile.downloadingSubtitle")
                                 : t("createProfile.chromiumSubtitle")}
                             </div>
                           </div>
                         </Button>
 
-                        {!getCreatableVersion("wayfern") && (
+                        {!getCreatableVersion("chromium") && (
                           <p className="pt-2 text-center text-sm text-muted-foreground">
                             {t("createProfile.browsersDownloading")}
                           </p>

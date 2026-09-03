@@ -671,6 +671,13 @@ mod tests {
       clear_on_close: false,
       created_at: None,
       updated_at: None,
+      managed_grok_marker_version: None,
+      managed_grok_marker_id: None,
+      managed_grok_marker_created_at: None,
+      managed_grok_target_id: None,
+      managed_grok_browser_pid: None,
+      managed_grok_cdp_port: None,
+      managed_grok_launch_generation: None,
     }
   }
 

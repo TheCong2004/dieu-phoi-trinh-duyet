@@ -16,7 +16,6 @@ import {
   LuUser,
   LuUsers,
   LuVideo,
-  LuWorkflow,
 } from "react-icons/lu";
 import { launchDonutClone } from "@/lib/donut-physics";
 import { MOTION_SPRING_POSITION } from "@/lib/motion";
@@ -35,7 +34,6 @@ export type AppPage =
   | "account"
   | "import"
   | "shortcuts"
-  | "chatflows"
   | "tasks"
   | "capcutpolot";
 
@@ -202,7 +200,6 @@ interface RailItem {
 
 const TOP_ITEMS: RailItem[] = [
   { page: "profiles", Icon: LuUser, labelKey: "rail.profiles" },
-  { page: "chatflows", Icon: LuWorkflow, labelKey: "rail.chatflows" },
   { page: "tasks", Icon: LuCalendarClock, labelKey: "rail.tasks" },
   { page: "capcutpolot", Icon: LuVideo, labelKey: "CapCutPolot Agent" },
   { page: "proxies", Icon: FiWifi, labelKey: "rail.network" },
@@ -320,9 +317,7 @@ export function RailNav({
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  onClick={() => {
-                    onNavigate(page);
-                  }}
+                  onClick={() => onNavigate(page)}
                   aria-label={t(labelKey)}
                   aria-current={active ? "page" : undefined}
                   className={cn(
@@ -336,7 +331,7 @@ export function RailNav({
                   <Icon className="size-3.5" />
                 </button>
               </TooltipTrigger>
-              <TooltipContent side="right">{t(labelKey)}</TooltipContent>
+                  <TooltipContent side="right">{t(labelKey)}</TooltipContent>
             </Tooltip>
           );
         })}

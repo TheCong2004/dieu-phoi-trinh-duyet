@@ -948,6 +948,13 @@ impl ProfileImporter {
           clear_on_close: false,
           created_at: None,
           updated_at: None,
+          managed_grok_marker_version: None,
+          managed_grok_marker_id: None,
+          managed_grok_marker_created_at: None,
+          managed_grok_target_id: None,
+          managed_grok_browser_pid: None,
+          managed_grok_cdp_port: None,
+          managed_grok_launch_generation: None,
         };
 
         match self
@@ -1013,6 +1020,13 @@ impl ProfileImporter {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      managed_grok_marker_version: None,
+      managed_grok_marker_id: None,
+      managed_grok_marker_created_at: None,
+      managed_grok_target_id: None,
+      managed_grok_browser_pid: None,
+      managed_grok_cdp_port: None,
+      managed_grok_launch_generation: None,
     };
 
     self.profile_manager.save_profile(&profile)?;

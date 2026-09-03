@@ -14,7 +14,10 @@ export { getCurrentOS } from "@/lib/platform";
  */
 export function getBrowserDisplayName(browserType: string): string {
   const browserNames: Record<string, string> = {
-    wayfern: "Wayfern",
+    chromium: "Chrome for Testing",
+    // Legacy data is retained for export/archive but is not a supported
+    // engine in the Local Free product.
+    wayfern: "Legacy unsupported",
   };
 
   return browserNames[browserType] || browserType;
@@ -27,6 +30,7 @@ export function getBrowserDisplayName(browserType: string): string {
  */
 export function getBrowserIcon(browserType: string) {
   switch (browserType) {
+    case "chromium":
     case "wayfern":
       return FaChrome;
     default:

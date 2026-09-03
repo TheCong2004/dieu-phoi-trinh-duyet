@@ -483,8 +483,8 @@
       "latestDownloading": "Загрузка версии ({{version}})...",
       "upgradeAvailable": "Доступна новая версия ({{version}}) {{browser}}."
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "На базе Wayfern",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "Локальный бесплатный браузер",
     "platformUnavailable": "{{browser}} пока недоступен на вашей платформе.",
     "passwordProtect": {
       "label": "Защитить этот профиль паролем",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Не удалось запустить Xray-core."
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "Профили",
     "extensions": "Расширения",
     "groups": "Группы",
@@ -1977,11 +1975,10 @@
     },
     "network": "Сеть",
     "integrations": "Интеграции",
-    "account": "Аккаунт"
+    "account": "Аккаунт",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "Сеть",
     "extensions": "Расширения",
     "groups": "Группы",
@@ -1990,7 +1987,8 @@
     "integrations": "Интеграции",
     "account": "Аккаунт",
     "import": "Импорт профиля",
-    "shortcuts": "Сочетания клавиш"
+    "shortcuts": "Сочетания клавиш",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

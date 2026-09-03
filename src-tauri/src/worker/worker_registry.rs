@@ -680,13 +680,20 @@ impl WorkerRegistry {
     // 3. Unified Worker Selection:
     let worker_id = if let Some(ref pid) = req.profile_id {
       // Pinned profile: Lookup specific worker and evaluate full eligibility (NEVER bypass capability!)
+      // A profile can have a legacy Wayfern record alongside its canonical
+      // Playwright record. Prefer the Playwright record whenever it exists;
+      // otherwise HashMap iteration may select the stale legacy entry first
+      // and incorrectly report the profile as unavailable.
       let target_worker = state
         .workers
         .values()
-        .find(|w| {
-          (&w.profile_id == pid || &w.worker_id == pid)
-            && (std::env::var_os("FLOWORD_PLAYWRIGHT_RUNTIME_URL").is_none()
-              || w.provider() == crate::worker::worker_types::WorkerProvider::Playwright)
+        .filter(|w| &w.profile_id == pid || &w.worker_id == pid)
+        .min_by_key(|w| {
+          if w.provider() == crate::worker::worker_types::WorkerProvider::Playwright {
+            0u8
+          } else {
+            1u8
+          }
         })
         .cloned();
 

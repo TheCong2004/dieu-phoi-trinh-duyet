@@ -1453,6 +1453,13 @@ async fn generate_sample_fingerprint(
     clear_on_close: false,
     created_at: None,
     updated_at: None,
+    managed_grok_marker_version: None,
+    managed_grok_marker_id: None,
+    managed_grok_marker_created_at: None,
+    managed_grok_target_id: None,
+    managed_grok_browser_pid: None,
+    managed_grok_cdp_port: None,
+    managed_grok_launch_generation: None,
   };
 
   if browser == "wayfern" {
@@ -1634,6 +1641,9 @@ pub fn run_headless() {
         if let Some(profiles) = startup_profiles {
           crate::worker::WORKER_REGISTRY
             .sync_startup_profiles(&profiles)
+            .await;
+          crate::browser_runner::BrowserRunner::instance()
+            .reconcile_committed_marker_carriers(&profiles)
             .await;
         }
 

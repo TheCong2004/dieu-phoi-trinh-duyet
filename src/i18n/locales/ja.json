@@ -483,8 +483,8 @@
       "latestDownloading": "バージョン ({{version}}) をダウンロード中...",
       "upgradeAvailable": "{{browser}} の新しいバージョン（{{version}}）が利用可能です。"
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "Wayfern搭載",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "ローカル無料ブラウザ",
     "platformUnavailable": "{{browser}} はまだお使いのプラットフォームで利用できません。",
     "passwordProtect": {
       "label": "このプロファイルをパスワードで保護",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "Xray-core を起動できませんでした。"
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "プロファイル",
     "extensions": "拡張機能",
     "groups": "グループ",
@@ -1977,11 +1975,10 @@
     },
     "network": "ネットワーク",
     "integrations": "連携",
-    "account": "アカウント"
+    "account": "アカウント",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "ネットワーク",
     "extensions": "拡張機能",
     "groups": "グループ",
@@ -1990,7 +1987,8 @@
     "integrations": "連携",
     "account": "アカウント",
     "import": "プロファイルをインポート",
-    "shortcuts": "キーボードショートカット"
+    "shortcuts": "キーボードショートカット",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

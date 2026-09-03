@@ -483,8 +483,8 @@
       "latestDownloading": "正在下载版本 ({{version}})...",
       "upgradeAvailable": "{{browser}} 有新版本（{{version}}）可用。"
     },
-    "chromiumLabel": "Chromium",
-    "chromiumSubtitle": "由 Wayfern 驱动",
+    "chromiumLabel": "Chrome for Testing",
+    "chromiumSubtitle": "本地免费浏览器",
     "platformUnavailable": "{{browser}} 在您的平台上尚不可用。",
     "passwordProtect": {
       "label": "为此配置文件设置密码保护",
@@ -1959,8 +1959,6 @@
     "xrayStartFailed": "无法启动 Xray-core。"
   },
   "rail": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "profiles": "配置文件",
     "extensions": "扩展",
     "groups": "分组",
@@ -1977,11 +1975,10 @@
     },
     "network": "网络",
     "integrations": "集成",
-    "account": "账号"
+    "account": "账号",
+    "tasks": "Tasks"
   },
   "pageTitle": {
-    "chatflows": "Workflows",
-    "tasks": "Tasks",
     "proxies": "网络",
     "extensions": "扩展",
     "groups": "分组",
@@ -1990,7 +1987,8 @@
     "integrations": "集成",
     "account": "账户",
     "import": "导入配置文件",
-    "shortcuts": "键盘快捷键"
+    "shortcuts": "键盘快捷键",
+    "tasks": "Tasks"
   },
   "encryption": {
     "required": {

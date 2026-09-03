@@ -87,6 +87,22 @@ pub struct BrowserProfile {
   /// NOT bumped by browser-file changes, which sync via the file manifest.
   #[serde(default)]
   pub updated_at: Option<u64>,
+  /// Durable ownership identity for the Floword-managed Grok tab.  These
+  /// fields are optional so legacy profile metadata remains readable.
+  #[serde(default)]
+  pub managed_grok_marker_version: Option<u32>,
+  #[serde(default)]
+  pub managed_grok_marker_id: Option<String>,
+  #[serde(default)]
+  pub managed_grok_marker_created_at: Option<u64>,
+  #[serde(default)]
+  pub managed_grok_target_id: Option<String>,
+  #[serde(default)]
+  pub managed_grok_browser_pid: Option<u32>,
+  #[serde(default)]
+  pub managed_grok_cdp_port: Option<u16>,
+  #[serde(default)]
+  pub managed_grok_launch_generation: Option<u64>,
 }
 
 pub fn default_release_type() -> String {

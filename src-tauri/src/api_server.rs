@@ -5,15 +5,17 @@ use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::tag_manager::TAG_MANAGER;
 use axum::{
-  extract::{Path, Query, State},
-  http::{header, HeaderMap, Method, StatusCode},
+  extract::{rejection::JsonRejection, Path, Query, State},
+  http::{header, HeaderMap, HeaderValue, Method, StatusCode},
   middleware::{self, Next},
   response::{IntoResponse, Json, Response},
-  routing::get,
+  routing::{delete, get, post},
   Router,
 };
+use futures_util::FutureExt;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
@@ -54,6 +56,9 @@ pub struct ApiProfile {
   /// Such a profile cannot be launched locally, and must only ever run on a
   /// remote host of its own OS — Chromium profile state is OS-specific.
   pub is_cross_os: bool,
+  /// Legacy Wayfern profiles remain readable/exportable but are not supported
+  /// by the Local Free runtime.
+  pub legacy_unsupported: bool,
 }
 
 impl From<&crate::profile::types::BrowserProfile> for ApiProfile {
@@ -81,6 +86,7 @@ impl From<&crate::profile::types::BrowserProfile> for ApiProfile {
       cloud_sync_enabled: profile.is_sync_enabled(),
       host_os: profile.resolved_os().map(|os| os.to_string()),
       is_cross_os: profile.is_cross_os(),
+      legacy_unsupported: profile.browser.eq_ignore_ascii_case("wayfern"),
     }
   }
 }
@@ -99,8 +105,7 @@ pub struct ApiProfileResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateProfileRequest {
   pub name: String,
-  /// Browser engine. Must be `"wayfern"` (anti-detect Chromium). Any other
-  /// value (e.g. `"chromium"`) is rejected with 400.
+  /// Browser engine for new profiles. Local Free accepts only `"chromium"`.
   pub browser: String,
   /// Optional. Omit (or pass `"latest"`) to use the newest already-downloaded
   /// version of the chosen browser. A concrete version must already be
@@ -327,6 +332,13 @@ pub struct ToastPayload {
 #[derive(Debug, Serialize, ToSchema)]
 struct RunProfileResponse {
   profile_id: String,
+  browser_engine: String,
+  browser_version: Option<String>,
+  browser_executable: Option<String>,
+  grok_target_id: Option<String>,
+  grok_page_url: Option<String>,
+  grok_target_reused: bool,
+  target_selection_source: Option<String>,
   remote_debugging_port: u16,
   headless: bool,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,6 +346,169 @@ struct RunProfileResponse {
   #[serde(skip_serializing_if = "Option::is_none")]
   launch_generation: Option<u64>,
   reused: bool,
+}
+
+/// Local browser-manager response. Unlike the legacy `/v1/profiles/{id}/run`
+/// response this contract is intentionally provider-neutral and uses the
+/// camelCase identity consumed by ArtCraft/Sidecar.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserSessionResponse {
+  profile_id: String,
+  browser_pid: u32,
+  remote_debugging_port: u16,
+  cdp_endpoint: String,
+  launch_generation: u64,
+  browser_engine: String,
+  grok_target_id: Option<String>,
+  grok_page_url: Option<String>,
+  reused: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPageResponse {
+  target_id: String,
+  page_type: String,
+  url: String,
+  title: String,
+  purpose: String,
+  managed: bool,
+  state: String,
+  browser_pid: u32,
+  launch_generation: u64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  page_lease_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPagesResponse {
+  profile_id: String,
+  browser_pid: u32,
+  remote_debugging_port: u16,
+  cdp_endpoint: String,
+  launch_generation: u64,
+  pages: Vec<LocalBrowserPageResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct LocalBrowserProfileSummary {
+  id: String,
+  name: String,
+  browser: String,
+  is_running: bool,
+  process_id: Option<u32>,
+  tags: Vec<String>,
+  group_id: Option<String>,
+  last_launch: Option<u64>,
+  proxy_id: Option<String>,
+  vpn_id: Option<String>,
+  sync_mode: String,
+  cloud_sync_enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct LocalBrowserProfilesResponse {
+  profiles: Vec<LocalBrowserProfileSummary>,
+  total: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPageRequest {
+  url: String,
+  #[serde(default = "default_local_page_purpose")]
+  purpose: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPageClaimRequest {
+  job_id: String,
+  request_id: String,
+  #[serde(default)]
+  target_id: Option<String>,
+  #[serde(default = "default_local_page_purpose")]
+  purpose: String,
+  #[serde(default = "default_local_max_pages")]
+  max_pages: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPageReleaseRequest {
+  page_lease_id: String,
+  job_id: String,
+  request_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserPageLeaseResponse {
+  profile_id: String,
+  browser_pid: u32,
+  remote_debugging_port: u16,
+  cdp_endpoint: String,
+  launch_generation: u64,
+  target_id: String,
+  page_lease_id: String,
+  page_reused: bool,
+  purpose: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalBrowserStopRequest {
+  profile_id: Option<String>,
+  browser_pid: Option<u32>,
+  remote_debugging_port: Option<u16>,
+  launch_generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalProxyRequest {
+  name: Option<String>,
+  proxy_settings: ProxySettings,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LocalProxyResponse {
+  profile_id: String,
+  proxy_id: Option<String>,
+  proxy_settings: Option<ProxySettings>,
+  has_credentials: bool,
+}
+
+fn default_local_page_purpose() -> String {
+  "USER".to_string()
+}
+
+fn default_local_max_pages() -> usize {
+  3
+}
+
+// In-memory ownership guard for pages explicitly created by the local
+// manager. Pages discovered from an existing browser are never considered
+// deletable unless they are the durable managed Grok target on the profile.
+lazy_static! {
+  static ref LOCAL_MANAGED_PAGES: Mutex<HashMap<String, HashSet<String>>> =
+    Mutex::new(HashMap::new());
+  static ref LOCAL_PAGE_LEASES: Mutex<HashMap<String, LocalPageLease>> = Mutex::new(HashMap::new());
+  static ref LOCAL_PAGE_CLAIM_LOCK: Mutex<()> = Mutex::new(());
+}
+
+#[derive(Debug, Clone)]
+struct LocalPageLease {
+  profile_id: String,
+  target_id: String,
+  page_lease_id: String,
+  job_id: String,
+  request_id: String,
+  purpose: String,
+  launch_generation: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -388,6 +563,19 @@ struct RunProfileRequest {
   /// Generic clients retain the historical AlwaysOpen behavior by default.
   #[serde(default)]
   cold_start_only: Option<bool>,
+  #[serde(default)]
+  browser_engine: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct TargetBindingConfirmRequest {
+  binding_session_id: String,
+  handle: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct TargetBindingSessionRequest {
+  binding_session_id: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -510,6 +698,10 @@ struct ImportProxiesResponse {
     update_profile,
     delete_profile,
     run_profile,
+    prepare_target_binding,
+    pending_target_binding,
+    confirm_target_binding,
+    abort_target_binding,
     open_url_in_profile,
     kill_profile,
     batch_run_profiles,
@@ -551,6 +743,8 @@ struct ImportProxiesResponse {
     download_browser_api,
     get_browser_versions,
     check_browser_downloaded,
+    local_browser_claim_page,
+    local_browser_release_page,
   ),
   components(schemas(
     ApiProfile,
@@ -587,6 +781,8 @@ struct ImportProxiesResponse {
     RunRemoteRequest,
     RunRemoteResponse,
     RunProfileRequest,
+    TargetBindingConfirmRequest,
+    TargetBindingSessionRequest,
     BatchRunRequest,
     BatchRunResult,
     BatchRunResponse,
@@ -606,6 +802,9 @@ struct ImportProxiesResponse {
     crate::profile_importer::DuplicateStrategy,
     crate::profile_importer::ProfileImportItemResult,
     crate::profile_importer::ProfileImportBatchResult,
+    LocalBrowserPageClaimRequest,
+    LocalBrowserPageReleaseRequest,
+    LocalBrowserPageLeaseResponse,
   )),
   tags(
     (name = "profiles", description = "Profile management endpoints"),
@@ -708,11 +907,31 @@ impl ApiServer {
       .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
       .port();
 
+    // Every local control-plane caller authenticates with the machine-local
+    // API token. Create one on first runtime start so Local Free does not
+    // depend on a cloud account or a paid entitlement.
+    let settings_manager = crate::settings_manager::SettingsManager::instance();
+    if settings_manager
+      .get_api_token(&app_handle)
+      .await
+      .ok()
+      .flatten()
+      .is_none()
+    {
+      if let Err(error) = settings_manager.generate_api_token(&app_handle).await {
+        log::warn!("[api] failed to initialize local API token: {error}");
+      }
+    }
+
     // Create router with OpenAPI documentation
     let (v1_routes, _) = OpenApiRouter::new()
       .routes(routes!(get_profiles, create_profile))
       .routes(routes!(get_profile, update_profile, delete_profile))
       .routes(routes!(run_profile))
+      .routes(routes!(prepare_target_binding))
+      .routes(routes!(pending_target_binding))
+      .routes(routes!(confirm_target_binding))
+      .routes(routes!(abort_target_binding))
       .routes(routes!(run_profile_remote))
       .routes(routes!(stop_remote_session))
       .routes(routes!(set_profile_cloud_sync))
@@ -761,6 +980,53 @@ impl ApiServer {
     let app = Router::new()
       .merge(v1_routes)
       .merge(crate::worker::worker_routes())
+      // Donut-owned local browser manager. These routes are local-only and
+      // entitlement-free, but still require the machine-local bearer token.
+      .merge(
+        Router::new()
+          .route(
+            "/v1/local/browser/profiles/{id}/run",
+            post(local_browser_run),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/stop",
+            post(local_browser_stop),
+          )
+          .route(
+            "/v1/local/browser/profiles",
+            get(local_browser_list_profiles).post(local_browser_create_profile),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/proxy",
+            get(local_browser_get_proxy)
+              .put(local_browser_put_proxy)
+              .delete(local_browser_delete_proxy),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/proxy/test",
+            post(local_browser_test_proxy),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/pages",
+            get(local_browser_list_pages).post(local_browser_create_page),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/pages/claim",
+            post(local_browser_claim_page),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/pages/{target_id}/release",
+            post(local_browser_release_page),
+          )
+          .route(
+            "/v1/local/browser/profiles/{id}/pages/{target_id}",
+            delete(local_browser_delete_page),
+          )
+          .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+          )),
+      )
       .route("/v1/runtime/health", get(runtime_health_handler))
       .route("/openapi.json", get(move || async move { Json(api) }))
       .route(
@@ -775,6 +1041,19 @@ impl ApiServer {
       .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024))
       .with_state(state);
 
+    if runtime_kind == "floword-donut-runtime" {
+      crate::browser_runner::reconcile_pending_binding_sessions_on_startup()
+        .await
+        .map_err(|error| {
+          crate::backend_error_with_detail("BINDING_SESSION_RECONCILIATION_FAILED", error)
+        })?;
+      crate::browser_runner::migrate_managed_grok_target_on_startup()
+        .await
+        .map_err(|error| {
+          crate::backend_error_with_detail("MANAGED_GROK_MIGRATION_FAILED", error)
+        })?;
+    }
+
     // Start server task
     let task_handle = tokio::spawn(async move {
       let server = axum::serve(listener, app);
@@ -787,6 +1066,14 @@ impl ApiServer {
     self.port = Some(actual_port);
     self.shutdown_tx = Some(shutdown_tx);
     self.task_handle = Some(task_handle);
+
+    // The headless Floword runtime owns Playwright worker registration and
+    // refreshes it independently of lease acquisition.  This keeps the
+    // PLAYWRIGHT record alive after restart while leaving legacy WAYFERN
+    // records untouched.
+    if runtime_kind == "floword-donut-runtime" {
+      crate::worker::worker_routes::start_playwright_bootstrap_loop();
+    }
 
     Ok(actual_port)
   }
@@ -806,16 +1093,82 @@ impl ApiServer {
 }
 
 // Terms and Conditions check middleware
-async fn terms_check_middleware(
-  request: axum::extract::Request,
-  next: Next,
-) -> Result<Response, StatusCode> {
+fn json_error_response(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+  let body = serde_json::json!({
+    "error": {
+      "code": code,
+      "message": message.into(),
+      "retryable": status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+    }
+  });
+  let mut response = (
+    status,
+    [(header::CONTENT_TYPE, "application/json")],
+    body.to_string(),
+  )
+    .into_response();
+  if let Ok(value) = HeaderValue::from_str(code) {
+    response.headers_mut().insert("x-floword-error-code", value);
+  }
+  response
+}
+
+fn json_error_response_with_details(
+  status: StatusCode,
+  code: &str,
+  message: impl Into<String>,
+  details: serde_json::Value,
+) -> Response {
+  let body = serde_json::json!({
+    "error": {
+      "code": code,
+      "message": message.into(),
+      "retryable": true,
+      "details": details,
+    }
+  });
+  let mut response = (
+    status,
+    [(header::CONTENT_TYPE, "application/json")],
+    body.to_string(),
+  )
+    .into_response();
+  if let Ok(value) = HeaderValue::from_str(code) {
+    response.headers_mut().insert("x-floword-error-code", value);
+  }
+  response
+}
+
+fn log_run_phase(
+  request_id: &str,
+  phase: &str,
+  profile_id: &str,
+  browser_pid: Option<u32>,
+  launch_generation: Option<u64>,
+) {
+  log::info!(
+    "[api-phase] {}",
+    serde_json::json!({
+      "requestId": request_id,
+      "phase": phase,
+      "profileIdHash": blake3::hash(profile_id.as_bytes()).to_hex().to_string()[..16].to_string(),
+      "browserPid": browser_pid,
+      "launchGeneration": launch_generation,
+    })
+  );
+}
+
+async fn terms_check_middleware(request: axum::extract::Request, next: Next) -> Response {
   // Check if Wayfern terms have been accepted
   if !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted() {
-    return Err(StatusCode::FORBIDDEN);
+    return json_error_response(
+      StatusCode::FORBIDDEN,
+      "TERMS_NOT_ACCEPTED",
+      "Wayfern terms must be accepted before using the API",
+    );
   }
 
-  Ok(next.run(request).await)
+  next.run(request).await
 }
 
 // Authentication middleware
@@ -824,12 +1177,12 @@ async fn auth_middleware(
   headers: HeaderMap,
   request: axum::extract::Request,
   next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
   let path = request.uri().path().to_string();
 
-  if state.runtime_kind == "floword-donut-runtime" {
+  if state.runtime_kind == "floword-donut-runtime" && !path.starts_with("/v1/local/") {
     // Embedded background runtime inside Floword Artcraft - local loopback without external token
-    return Ok(next.run(request).await);
+    return next.run(request).await;
   }
 
   // Floword Studio talks to the Donut Manager over the loopback-only runtime
@@ -843,7 +1196,7 @@ async fn auth_middleware(
       .map(|value| value == "1")
       .unwrap_or(false);
   if floword_integration {
-    return Ok(next.run(request).await);
+    return next.run(request).await;
   }
 
   // Get the Authorization header
@@ -856,7 +1209,11 @@ async fn auth_middleware(
     Some(token) => token,
     None => {
       log::warn!("[api] Rejected {path}: missing Authorization header");
-      return Err(StatusCode::UNAUTHORIZED);
+      return json_error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "missing authorization",
+      );
     }
   };
 
@@ -868,11 +1225,19 @@ async fn auth_middleware(
       log::warn!(
         "[api] Rejected {path}: API server has no stored token (was the API toggled off?)"
       );
-      return Err(StatusCode::UNAUTHORIZED);
+      return json_error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "API server has no stored token",
+      );
     }
     Err(e) => {
       log::error!("[api] Failed to read stored API token: {e}");
-      return Err(StatusCode::INTERNAL_SERVER_ERROR);
+      return json_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "AUTH_TOKEN_READ_FAILED",
+        "failed to read stored API token",
+      );
     }
   };
 
@@ -885,25 +1250,79 @@ async fn auth_middleware(
   let matches = token_bytes.len() == stored_bytes.len() && token_bytes.ct_eq(stored_bytes).into();
   if !matches {
     log::warn!("[api] Rejected {path}: token mismatch");
-    return Err(StatusCode::UNAUTHORIZED);
+    return json_error_response(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "token mismatch");
   }
 
   // Token is valid, continue with the request
-  Ok(next.run(request).await)
+  next.run(request).await
 }
 
 /// Logs every request: method, path, query, response status, duration.
 /// Skips Authorization header and request bodies entirely.
-async fn request_logging_middleware(request: axum::extract::Request, next: Next) -> Response {
+async fn request_logging_middleware(mut request: axum::extract::Request, next: Next) -> Response {
   let method = request.method().clone();
   let path = request.uri().path().to_string();
   let query = request.uri().query().map(|q| q.to_string());
   let started = std::time::Instant::now();
 
-  let response = next.run(request).await;
+  let request_id = request
+    .headers()
+    .get("X-Floword-Request-Id")
+    .and_then(|value| value.to_str().ok())
+    .filter(|value| {
+      !value.is_empty()
+        && value.len() <= 128
+        && value
+          .chars()
+          .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    })
+    .map(str::to_string)
+    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+  let profile_id_hash = path
+    .strip_prefix("/v1/profiles/")
+    .and_then(|value| value.split('/').next())
+    .filter(|value| !value.is_empty())
+    .map(|value| blake3::hash(value.as_bytes()).to_hex().to_string()[..16].to_string());
+  if let Ok(value) = HeaderValue::from_str(&request_id) {
+    request.headers_mut().insert("x-floword-request-id", value);
+  }
+  log::info!(
+    "[api-phase] {}",
+    serde_json::json!({
+      "requestId": request_id,
+      "phase": "HTTP_REQUEST_ACCEPTED",
+      "profileIdHash": profile_id_hash,
+    })
+  );
+
+  let mut response = next.run(request).await;
 
   let status = response.status();
   let elapsed_ms = started.elapsed().as_millis();
+  if let Ok(value) = HeaderValue::from_str(&request_id) {
+    response.headers_mut().insert("x-floword-request-id", value);
+  }
+  if status.is_server_error() && !response.headers().contains_key("x-floword-error-code") {
+    response.headers_mut().insert(
+      "x-floword-error-code",
+      HeaderValue::from_static("INTERNAL_ERROR"),
+    );
+  }
+  log::log!(
+    if status.is_server_error() {
+      log::Level::Error
+    } else {
+      log::Level::Info
+    },
+    "[api-phase] {}",
+    serde_json::json!({
+      "requestId": request_id,
+      "phase": "HTTP_RESPONSE_WRITTEN",
+      "statusCode": status.as_u16(),
+      "profileIdHash": profile_id_hash,
+      "elapsedMs": elapsed_ms,
+    })
+  );
 
   let level = if status.is_server_error() {
     log::Level::Error
@@ -1209,11 +1628,12 @@ async fn create_profile(
   // else up front — otherwise the profile is created with no fingerprint and an
   // unrecognized browser, then crashes with a 500 on /run. Mirrors the MCP
   // create_profile validation.
-  if request.browser != "wayfern" {
+  let browser = request.browser.trim().to_ascii_lowercase();
+  if browser != "chromium" {
     return Err((
       StatusCode::BAD_REQUEST,
       format!(
-        "Invalid browser \"{}\". Must be \"wayfern\" (anti-detect Chromium).",
+        "Invalid browser \"{}\". New profiles must use \"chromium\".",
         request.browser
       ),
     ));
@@ -1225,9 +1645,10 @@ async fn create_profile(
   // locally — we don't fetch new versions here. 400 if none is downloaded.
   let version = match request.version.as_deref() {
     Some(v) if !v.is_empty() && v != "latest" => v.to_string(),
+    _ if browser == "chromium" => "staged".to_string(),
     _ => {
       let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
-      let mut versions = registry.get_downloaded_versions(&request.browser);
+      let mut versions = registry.get_downloaded_versions(&browser);
       // browsers is a HashMap, so keys are unordered — sort newest-first by
       // semver before taking the latest.
       versions.sort_by(|a, b| crate::api_client::compare_versions(b, a));
@@ -1238,7 +1659,7 @@ async fn create_profile(
             StatusCode::BAD_REQUEST,
             format!(
               "No downloaded version of \"{}\" is available. Download the browser in Donut Browser first — this endpoint does not download browsers.",
-              request.browser
+                browser
             ),
           ));
         }
@@ -1247,11 +1668,7 @@ async fn create_profile(
   };
 
   // Parse wayfern config if provided
-  let wayfern_config = if let Some(config) = &request.wayfern_config {
-    serde_json::from_value(config.clone()).ok()
-  } else {
-    None
-  };
+  let wayfern_config = None;
 
   // Reject a dead/unreachable proxy or VPN before creating the profile. A 402
   // (expired proxy subscription) maps to 402; anything else is a 400.
@@ -1276,7 +1693,7 @@ async fn create_profile(
     .create_profile_with_group(
       &state.app_handle,
       &request.name,
-      &request.browser,
+      &browser,
       &version,
       request.release_type.as_deref().unwrap_or("stable"),
       request.proxy_id.clone(),
@@ -2409,9 +2826,1379 @@ async fn delete_extension_group_api(
 async fn run_profile(
   Path(id): Path<String>,
   State(state): State<ApiServerState>,
+  headers: HeaderMap,
   Json(request): Json<RunProfileRequest>,
+) -> Response {
+  match std::panic::AssertUnwindSafe(run_profile_inner(id, state, headers, request, true))
+    .catch_unwind()
+    .await
+  {
+    Ok(Ok(Json(body))) => Json(body).into_response(),
+    Ok(Err((status, body))) => run_profile_error_response(status, body),
+    Err(_) => json_error_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "RUN_TASK_PANICKED",
+      "profile launch task panicked",
+    ),
+  }
+}
+
+/// Donut-owned local browser run. This is intentionally separate from the
+/// paid/remote profile endpoint above: it only accepts CFT/Chromium profiles
+/// and launches the local browser through the existing BrowserRunner.
+async fn local_browser_list_profiles() -> Response {
+  let profiles = match ProfileManager::instance().list_profiles() {
+    Ok(profiles) => profiles,
+    Err(error) => {
+      return json_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "PROFILE_LIST_FAILED",
+        error.to_string(),
+      )
+    }
+  };
+  let summaries = profiles
+    .into_iter()
+    .filter(|profile| crate::browser::is_chrome_for_testing_alias(&profile.browser))
+    .map(|profile| LocalBrowserProfileSummary {
+      id: profile.id.to_string(),
+      name: profile.name,
+      browser: profile.browser,
+      is_running: profile.process_id.is_some(),
+      process_id: profile.process_id,
+      tags: profile.tags,
+      group_id: profile.group_id,
+      last_launch: profile.last_launch,
+      proxy_id: profile.proxy_id,
+      vpn_id: profile.vpn_id,
+      cloud_sync_enabled: profile.sync_mode != crate::profile::types::SyncMode::Disabled,
+      sync_mode: format!("{:?}", profile.sync_mode),
+    })
+    .collect::<Vec<_>>();
+  let total = summaries.len();
+  Json(LocalBrowserProfilesResponse {
+    profiles: summaries,
+    total,
+  })
+  .into_response()
+}
+
+async fn local_browser_create_profile(
+  State(state): State<ApiServerState>,
+  Json(request): Json<CreateProfileRequest>,
+) -> Response {
+  if !crate::browser::is_chrome_for_testing_alias(&request.browser) {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_BROWSER_ENGINE_REQUIRED",
+      "new local profiles must use chromium",
+    );
+  }
+  if request.name.trim().is_empty() {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "PROFILE_NAME_REQUIRED",
+      "profile name is required",
+    );
+  }
+  match ProfileManager::instance()
+    .create_profile_with_group(
+      &state.app_handle,
+      &request.name,
+      "chromium",
+      "staged",
+      request.release_type.as_deref().unwrap_or("stable"),
+      request.proxy_id,
+      request.vpn_id,
+      None,
+      request.group_id,
+      false,
+      None,
+      request.launch_hook,
+    )
+    .await
+  {
+    Ok(profile) => Json(ApiProfileResponse {
+      profile: ApiProfile::from(&profile),
+    })
+    .into_response(),
+    Err(error) => json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_PROFILE_CREATE_FAILED",
+      error.to_string(),
+    ),
+  }
+}
+
+async fn local_browser_run(
+  Path(id): Path<String>,
+  State(state): State<ApiServerState>,
+  Json(request): Json<RunProfileRequest>,
+) -> Response {
+  let profile = match ProfileManager::instance()
+    .list_profiles()
+    .ok()
+    .and_then(|profiles| {
+      profiles
+        .into_iter()
+        .find(|profile| profile.id.to_string() == id)
+    }) {
+    Some(profile) => profile,
+    None => {
+      return json_error_response(
+        StatusCode::NOT_FOUND,
+        "PROFILE_NOT_FOUND",
+        "profile not found",
+      )
+    }
+  };
+  if !crate::browser::is_chrome_for_testing_alias(&profile.browser) {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_BROWSER_ENGINE_REQUIRED",
+      "local browser manager only supports Chrome for Testing/Chromium profiles",
+    );
+  }
+  match std::panic::AssertUnwindSafe(run_profile_inner(
+    id,
+    state,
+    HeaderMap::new(),
+    request,
+    false,
+  ))
+  .catch_unwind()
+  .await
+  {
+    Ok(Ok(Json(body))) => {
+      let browser_pid = body.browser_pid.unwrap_or_default();
+      let launch_generation = body.launch_generation.unwrap_or_default();
+      if browser_pid == 0 || body.remote_debugging_port == 0 || launch_generation == 0 {
+        return json_error_response(
+          StatusCode::INTERNAL_SERVER_ERROR,
+          "LOCAL_BROWSER_IDENTITY_INVALID",
+          "browser identity was incomplete",
+        );
+      }
+      if let Some(target_id) = body.grok_target_id.as_deref() {
+        let mut pages = LOCAL_MANAGED_PAGES.lock().await;
+        pages
+          .entry(body.profile_id.clone())
+          .or_default()
+          .insert(target_id.to_string());
+      }
+      Json(LocalBrowserSessionResponse {
+        profile_id: body.profile_id,
+        browser_pid,
+        remote_debugging_port: body.remote_debugging_port,
+        cdp_endpoint: format!("http://127.0.0.1:{}", body.remote_debugging_port),
+        launch_generation,
+        browser_engine: body.browser_engine,
+        grok_target_id: body.grok_target_id,
+        grok_page_url: body.grok_page_url,
+        reused: body.reused,
+      })
+      .into_response()
+    }
+    Ok(Err((status, body))) => run_profile_error_response(status, body),
+    Err(_) => json_error_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "LOCAL_BROWSER_RUN_PANICKED",
+      "local browser run panicked",
+    ),
+  }
+}
+
+async fn local_browser_stop(
+  Path(id): Path<String>,
+  State(state): State<ApiServerState>,
+  request: Option<Json<LocalBrowserStopRequest>>,
+) -> Response {
+  let (profile, _port, _pid, _generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let requested = request.map(|Json(value)| value).unwrap_or_default();
+  let current_profile_id = profile.id.to_string();
+  let current_pid = profile.process_id.unwrap_or_default();
+  let current_port = profile.managed_grok_cdp_port.unwrap_or_default();
+  let current_generation = profile.last_launch.unwrap_or_default();
+  let stale = requested
+    .profile_id
+    .as_deref()
+    .is_some_and(|value| value != current_profile_id)
+    || requested
+      .browser_pid
+      .is_some_and(|value| value != current_pid)
+    || requested
+      .remote_debugging_port
+      .is_some_and(|value| value != current_port)
+    || requested
+      .launch_generation
+      .is_some_and(|value| value != current_generation);
+  if stale {
+    return json_error_response_with_details(
+      StatusCode::CONFLICT,
+      "BROWSER_SESSION_IDENTITY_STALE",
+      "the requested browser identity is stale; refresh from Donut and retry once",
+      serde_json::json!({
+        "profileId": current_profile_id,
+        "browserPid": current_pid,
+        "remoteDebuggingPort": current_port,
+        "launchGeneration": current_generation,
+      }),
+    );
+  }
+  match crate::browser_runner::BrowserRunner::instance()
+    .stop_browser_process_with_result(state.app_handle, &profile)
+    .await
+  {
+    Ok(result) => Json(result).into_response(),
+    Err(error) => json_error_response(
+      StatusCode::CONFLICT,
+      "LOCAL_BROWSER_STOP_FAILED",
+      error.to_string(),
+    ),
+  }
+}
+
+fn local_profile_identity(
+  id: &str,
+) -> Result<(crate::profile::types::BrowserProfile, u16, u32, u64), Response> {
+  let profile = ProfileManager::instance()
+    .list_profiles()
+    .map_err(|_| {
+      json_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "PROFILE_LIST_FAILED",
+        "failed to list profiles",
+      )
+    })?
+    .into_iter()
+    .find(|profile| profile.id.to_string() == id)
+    .ok_or_else(|| {
+      json_error_response(
+        StatusCode::NOT_FOUND,
+        "PROFILE_NOT_FOUND",
+        "profile not found",
+      )
+    })?;
+  if !crate::browser::is_chrome_for_testing_alias(&profile.browser) {
+    return Err(json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_BROWSER_ENGINE_REQUIRED",
+      "profile is not a Chrome for Testing profile",
+    ));
+  }
+  let pid = profile.process_id.ok_or_else(|| {
+    json_error_response(
+      StatusCode::CONFLICT,
+      "PROFILE_NOT_RUNNING",
+      "profile is not running",
+    )
+  })?;
+  let generation = profile.last_launch.ok_or_else(|| {
+    json_error_response(
+      StatusCode::CONFLICT,
+      "PROFILE_NOT_RUNNING",
+      "profile launch identity is unavailable",
+    )
+  })?;
+  let profiles_dir = ProfileManager::instance().get_profiles_dir();
+  let port = profile
+    .managed_grok_cdp_port
+    .or_else(|| {
+      let path = crate::ephemeral_dirs::get_effective_profile_path(&profile, &profiles_dir)
+        .join("floword-chromium")
+        .join(".floword-cdp-port");
+      std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+    })
+    .ok_or_else(|| {
+      json_error_response(
+        StatusCode::CONFLICT,
+        "CDP_PORT_UNAVAILABLE",
+        "profile CDP port is unavailable",
+      )
+    })?;
+  Ok((profile, port, pid, generation))
+}
+
+fn local_managed_pages_path(profile: &crate::profile::types::BrowserProfile) -> std::path::PathBuf {
+  let root = ProfileManager::instance().get_profiles_dir();
+  crate::ephemeral_dirs::get_effective_profile_path(profile, &root)
+    .join("floword-managed-pages.json")
+}
+
+fn read_durable_managed_pages(profile: &crate::profile::types::BrowserProfile) -> HashSet<String> {
+  std::fs::read_to_string(local_managed_pages_path(profile))
+    .ok()
+    .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|id| {
+      !id.is_empty()
+        && id
+          .chars()
+          .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+    .collect()
+}
+
+fn write_durable_managed_pages(
+  profile: &crate::profile::types::BrowserProfile,
+  pages: &HashSet<String>,
+) -> Result<(), String> {
+  let path = local_managed_pages_path(profile);
+  let parent = path
+    .parent()
+    .ok_or_else(|| "MANAGED_PAGE_PATH_INVALID".to_string())?;
+  std::fs::create_dir_all(parent).map_err(|e| format!("MANAGED_PAGE_DIR_FAILED: {e}"))?;
+  let tmp = path.with_extension("json.tmp");
+  let mut values = pages.iter().cloned().collect::<Vec<_>>();
+  values.sort();
+  let body = serde_json::to_vec_pretty(&values)
+    .map_err(|e| format!("MANAGED_PAGE_SERIALIZE_FAILED: {e}"))?;
+  std::fs::write(&tmp, body).map_err(|e| format!("MANAGED_PAGE_WRITE_FAILED: {e}"))?;
+  std::fs::rename(&tmp, &path).map_err(|e| format!("MANAGED_PAGE_COMMIT_FAILED: {e}"))
+}
+
+fn local_proxy_response(
+  profile_id: &str,
+  proxy_id: Option<String>,
+  settings: Option<ProxySettings>,
+) -> Response {
+  let has_credentials = settings
+    .as_ref()
+    .and_then(|value| value.username.as_ref())
+    .is_some()
+    || settings
+      .as_ref()
+      .and_then(|value| value.password.as_ref())
+      .is_some();
+  let sanitized = settings.map(|mut value| {
+    value.password = None;
+    value
+  });
+  Json(LocalProxyResponse {
+    profile_id: profile_id.to_string(),
+    proxy_id,
+    proxy_settings: sanitized,
+    has_credentials,
+  })
+  .into_response()
+}
+
+async fn local_browser_get_proxy(Path(id): Path<String>) -> Response {
+  let profile = match ProfileManager::instance()
+    .list_profiles()
+    .ok()
+    .and_then(|profiles| {
+      profiles
+        .into_iter()
+        .find(|profile| profile.id.to_string() == id)
+    }) {
+    Some(profile) => profile,
+    None => {
+      return json_error_response(
+        StatusCode::NOT_FOUND,
+        "PROFILE_NOT_FOUND",
+        "profile not found",
+      )
+    }
+  };
+  let settings = profile
+    .proxy_id
+    .as_deref()
+    .and_then(|proxy_id| PROXY_MANAGER.get_proxy_settings_by_id(proxy_id));
+  local_proxy_response(&id, profile.proxy_id, settings)
+}
+
+async fn local_browser_put_proxy(
+  Path(id): Path<String>,
+  State(state): State<ApiServerState>,
+  Json(request): Json<LocalProxyRequest>,
+) -> Response {
+  if request.proxy_settings.host.trim().is_empty() || request.proxy_settings.port == 0 {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_PROXY_INVALID",
+      "proxy host and port are required",
+    );
+  }
+  let profile = match ProfileManager::instance()
+    .list_profiles()
+    .ok()
+    .and_then(|profiles| {
+      profiles
+        .into_iter()
+        .find(|profile| profile.id.to_string() == id)
+    }) {
+    Some(profile) => profile,
+    None => {
+      return json_error_response(
+        StatusCode::NOT_FOUND,
+        "PROFILE_NOT_FOUND",
+        "profile not found",
+      )
+    }
+  };
+  let name = request.name.unwrap_or_else(|| format!("local-{id}"));
+  let stored = if let Some(proxy_id) = profile.proxy_id.as_deref() {
+    match PROXY_MANAGER.update_stored_proxy(
+      &state.app_handle,
+      proxy_id,
+      None,
+      Some(request.proxy_settings.clone()),
+    ) {
+      Ok(proxy) => proxy,
+      Err(_) => {
+        match PROXY_MANAGER.create_stored_proxy(&state.app_handle, name, request.proxy_settings) {
+          Ok(proxy) => proxy,
+          Err(error) => {
+            return json_error_response(StatusCode::BAD_REQUEST, "LOCAL_PROXY_SAVE_FAILED", error)
+          }
+        }
+      }
+    }
+  } else {
+    match PROXY_MANAGER.create_stored_proxy(&state.app_handle, name, request.proxy_settings) {
+      Ok(proxy) => proxy,
+      Err(error) => {
+        return json_error_response(StatusCode::BAD_REQUEST, "LOCAL_PROXY_SAVE_FAILED", error)
+      }
+    }
+  };
+  match ProfileManager::instance()
+    .update_profile_proxy(state.app_handle.clone(), &id, Some(stored.id.clone()))
+    .await
+  {
+    Ok(_) => local_proxy_response(&id, Some(stored.id), Some(stored.proxy_settings)),
+    Err(error) => json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_PROXY_ASSIGN_FAILED",
+      error.to_string(),
+    ),
+  }
+}
+
+async fn local_browser_delete_proxy(
+  Path(id): Path<String>,
+  State(state): State<ApiServerState>,
+) -> Response {
+  match ProfileManager::instance()
+    .update_profile_proxy(state.app_handle, &id, None)
+    .await
+  {
+    Ok(_) => local_proxy_response(&id, None, None),
+    Err(error) => json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_PROXY_CLEAR_FAILED",
+      error.to_string(),
+    ),
+  }
+}
+
+async fn local_browser_test_proxy(Path(id): Path<String>) -> Response {
+  let profile = match ProfileManager::instance()
+    .list_profiles()
+    .ok()
+    .and_then(|profiles| {
+      profiles
+        .into_iter()
+        .find(|profile| profile.id.to_string() == id)
+    }) {
+    Some(profile) => profile,
+    None => {
+      return json_error_response(
+        StatusCode::NOT_FOUND,
+        "PROFILE_NOT_FOUND",
+        "profile not found",
+      )
+    }
+  };
+  let Some(proxy_id) = profile.proxy_id.as_deref() else {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "LOCAL_PROXY_NOT_CONFIGURED",
+      "profile has no local proxy",
+    );
+  };
+  let Some(settings) = PROXY_MANAGER.get_proxy_settings_by_id(proxy_id) else {
+    return json_error_response(
+      StatusCode::NOT_FOUND,
+      "LOCAL_PROXY_NOT_FOUND",
+      "local proxy configuration not found",
+    );
+  };
+  match PROXY_MANAGER
+    .check_proxy_validity(proxy_id, &settings)
+    .await
+  {
+    Ok(result) => Json(result).into_response(),
+    Err(error) => json_error_response(StatusCode::BAD_GATEWAY, "LOCAL_PROXY_TEST_FAILED", error),
+  }
+}
+
+async fn local_browser_list_pages(Path(id): Path<String>) -> Response {
+  let (profile, port, pid, generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let cdp_pages = match crate::browser_runner::list_cdp_pages(port).await {
+    Ok(pages) => pages,
+    Err(error) => return json_error_response(StatusCode::BAD_GATEWAY, "CDP_UNAVAILABLE", error),
+  };
+  let mut managed = read_durable_managed_pages(&profile);
+  managed.extend(
+    LOCAL_MANAGED_PAGES
+      .lock()
+      .await
+      .get(&id)
+      .cloned()
+      .unwrap_or_default(),
+  );
+  let leases = LOCAL_PAGE_LEASES.lock().await.clone();
+  let durable_target = profile.managed_grok_target_id.clone();
+  let pages = cdp_pages
+    .into_iter()
+    .map(|page| {
+      let is_managed =
+        managed.contains(&page.id) || durable_target.as_deref() == Some(page.id.as_str());
+      let lease = leases.values().find(|lease| {
+        lease.profile_id == id
+          && lease.target_id == page.id
+          && lease.launch_generation == generation
+      });
+      LocalBrowserPageResponse {
+        target_id: page.id,
+        page_type: "page".into(),
+        url: page.url,
+        title: page.title,
+        purpose: lease.map(|value| value.purpose.clone()).unwrap_or_else(|| {
+          if is_managed {
+            "GROK_AUTOMATION".into()
+          } else {
+            "USER".into()
+          }
+        }),
+        managed: is_managed,
+        state: if lease.is_some() {
+          "LEASED".into()
+        } else {
+          "IDLE".into()
+        },
+        browser_pid: pid,
+        launch_generation: generation,
+        page_lease_id: lease.map(|value| value.page_lease_id.clone()),
+      }
+    })
+    .collect();
+  Json(LocalBrowserPagesResponse {
+    profile_id: id,
+    browser_pid: pid,
+    remote_debugging_port: port,
+    cdp_endpoint: format!("http://127.0.0.1:{port}"),
+    launch_generation: generation,
+    pages,
+  })
+  .into_response()
+}
+
+async fn local_browser_create_page(
+  Path(id): Path<String>,
+  Json(request): Json<LocalBrowserPageRequest>,
+) -> Response {
+  if request.url.trim().is_empty() {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "PAGE_URL_REQUIRED",
+      "url is required",
+    );
+  }
+  let (profile, port, pid, generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let page = match crate::browser_runner::create_cdp_page(port, request.url.trim()).await {
+    Ok(page) => page,
+    Err(error) => {
+      return json_error_response(StatusCode::BAD_GATEWAY, "CDP_PAGE_CREATE_FAILED", error)
+    }
+  };
+  let mut owned = read_durable_managed_pages(&profile);
+  owned.insert(page.id.clone());
+  if let Err(error) = write_durable_managed_pages(&profile, &owned) {
+    let _ = crate::browser_runner::close_cdp_page(port, &page.id).await;
+    return json_error_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "MANAGED_PAGE_PERSIST_FAILED",
+      error,
+    );
+  }
+  LOCAL_MANAGED_PAGES
+    .lock()
+    .await
+    .entry(id.clone())
+    .or_default()
+    .insert(page.id.clone());
+  Json(serde_json::json!({ "page": LocalBrowserPageResponse { target_id: page.id, page_type: "page".into(), url: page.url, title: page.title, purpose: request.purpose, managed: true, state: "IDLE".into(), browser_pid: pid, launch_generation: generation, page_lease_id: Option::<String>::None } })).into_response()
+}
+
+#[utoipa::path(
+  post,
+  path = "/v1/local/browser/profiles/{id}/pages/claim",
+  params(("id" = String, Path, description = "Chrome for Testing profile ID")),
+  request_body = LocalBrowserPageClaimRequest,
+  responses(
+    (status = 200, body = LocalBrowserPageLeaseResponse),
+    (status = 400, description = "Invalid correlation or pool limit"),
+    (status = 409, description = "Page pool busy or stale target")
+  ),
+  tag = "profiles"
+)]
+async fn local_browser_claim_page(
+  Path(id): Path<String>,
+  Json(request): Json<LocalBrowserPageClaimRequest>,
+) -> Response {
+  if request.job_id.trim().is_empty() || request.request_id.trim().is_empty() {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "PAGE_CLAIM_CORRELATION_REQUIRED",
+      "jobId and requestId are required",
+    );
+  }
+  if !(1..=16).contains(&request.max_pages) {
+    return json_error_response(
+      StatusCode::BAD_REQUEST,
+      "PAGE_POOL_LIMIT_INVALID",
+      "maxPages must be between 1 and 16",
+    );
+  }
+  let _claim_guard = LOCAL_PAGE_CLAIM_LOCK.lock().await;
+  let (profile, port, pid, generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let cdp_pages = match crate::browser_runner::list_cdp_pages(port).await {
+    Ok(pages) => pages,
+    Err(error) => return json_error_response(StatusCode::BAD_GATEWAY, "CDP_UNAVAILABLE", error),
+  };
+  let mut managed = read_durable_managed_pages(&profile);
+  managed.extend(
+    LOCAL_MANAGED_PAGES
+      .lock()
+      .await
+      .get(&id)
+      .cloned()
+      .unwrap_or_default(),
+  );
+  if let Some(target_id) = profile.managed_grok_target_id.as_ref() {
+    managed.insert(target_id.clone());
+  }
+  let leases_snapshot = LOCAL_PAGE_LEASES.lock().await.clone();
+  if let Some(existing) = leases_snapshot
+    .values()
+    .find(|lease| {
+      lease.profile_id == id
+        && lease.job_id == request.job_id
+        && lease.request_id == request.request_id
+        && lease.launch_generation == generation
+    })
+    .cloned()
+  {
+    return Json(LocalBrowserPageLeaseResponse {
+      profile_id: id,
+      browser_pid: pid,
+      remote_debugging_port: port,
+      cdp_endpoint: format!("http://127.0.0.1:{port}"),
+      launch_generation: generation,
+      target_id: existing.target_id,
+      page_lease_id: existing.page_lease_id,
+      page_reused: true,
+      purpose: existing.purpose,
+    })
+    .into_response();
+  }
+  let target = if let Some(target_id) = request.target_id.as_deref() {
+    let page = cdp_pages.iter().find(|page| page.id == target_id);
+    let is_grok = page
+      .and_then(|value| url::Url::parse(&value.url).ok())
+      .and_then(|value| {
+        value
+          .host_str()
+          .map(|host| host.eq_ignore_ascii_case("grok.com") || host.ends_with(".grok.com"))
+      })
+      .unwrap_or(false);
+    if page.is_none() || !managed.contains(target_id) || !is_grok {
+      return json_error_response(
+        StatusCode::CONFLICT,
+        "GROK_MANAGED_TARGET_STALE",
+        "requested target is not a managed local page",
+      );
+    }
+    if leases_snapshot
+      .values()
+      .any(|lease| lease.profile_id == id && lease.target_id == target_id)
+    {
+      return json_error_response(
+        StatusCode::CONFLICT,
+        "PAGE_POOL_BUSY",
+        "requested page is already leased",
+      );
+    }
+    target_id.to_string()
+  } else {
+    let idle = cdp_pages.iter().find(|page| {
+      let is_grok = url::Url::parse(&page.url)
+        .ok()
+        .and_then(|value| {
+          value
+            .host_str()
+            .map(|host| host.eq_ignore_ascii_case("grok.com") || host.ends_with(".grok.com"))
+        })
+        .unwrap_or(false);
+      managed.contains(&page.id)
+        && is_grok
+        && !leases_snapshot
+          .values()
+          .any(|lease| lease.profile_id == id && lease.target_id == page.id)
+    });
+    if let Some(page) = idle {
+      page.id.clone()
+    } else {
+      let managed_count = cdp_pages
+        .iter()
+        .filter(|page| managed.contains(&page.id))
+        .count();
+      if managed_count >= request.max_pages {
+        return json_error_response(
+          StatusCode::CONFLICT,
+          "PAGE_POOL_BUSY",
+          "managed page pool is full",
+        );
+      }
+      let page =
+        match crate::browser_runner::create_cdp_page(port, "https://grok.com/imagine").await {
+          Ok(page) => page,
+          Err(error) => {
+            return json_error_response(StatusCode::BAD_GATEWAY, "CDP_PAGE_CREATE_FAILED", error)
+          }
+        };
+      managed.insert(page.id.clone());
+      if let Err(error) = write_durable_managed_pages(&profile, &managed) {
+        let _ = crate::browser_runner::close_cdp_page(port, &page.id).await;
+        return json_error_response(
+          StatusCode::INTERNAL_SERVER_ERROR,
+          "MANAGED_PAGE_PERSIST_FAILED",
+          error,
+        );
+      }
+      LOCAL_MANAGED_PAGES
+        .lock()
+        .await
+        .entry(id.clone())
+        .or_default()
+        .insert(page.id.clone());
+      page.id
+    }
+  };
+  let page_lease_id = uuid::Uuid::new_v4().to_string();
+  let lease = LocalPageLease {
+    profile_id: id.clone(),
+    target_id: target.clone(),
+    page_lease_id: page_lease_id.clone(),
+    job_id: request.job_id.clone(),
+    request_id: request.request_id.clone(),
+    purpose: request.purpose.clone(),
+    launch_generation: generation,
+  };
+  LOCAL_PAGE_LEASES
+    .lock()
+    .await
+    .insert(page_lease_id.clone(), lease);
+  Json(LocalBrowserPageLeaseResponse {
+    profile_id: id,
+    browser_pid: pid,
+    remote_debugging_port: port,
+    cdp_endpoint: format!("http://127.0.0.1:{port}"),
+    launch_generation: generation,
+    target_id: target,
+    page_lease_id,
+    page_reused: false,
+    purpose: request.purpose,
+  })
+  .into_response()
+}
+
+#[utoipa::path(
+  post,
+  path = "/v1/local/browser/profiles/{id}/pages/{target_id}/release",
+  params(
+    ("id" = String, Path, description = "Chrome for Testing profile ID"),
+    ("target_id" = String, Path, description = "Managed page target ID")
+  ),
+  request_body = LocalBrowserPageReleaseRequest,
+  responses(
+    (status = 200, description = "Lease released idempotently"),
+    (status = 409, description = "Lease identity mismatch")
+  ),
+  tag = "profiles"
+)]
+async fn local_browser_release_page(
+  Path((id, target_id)): Path<(String, String)>,
+  Json(request): Json<LocalBrowserPageReleaseRequest>,
+) -> Response {
+  let (_profile, _port, _pid, generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let mut leases = LOCAL_PAGE_LEASES.lock().await;
+  let Some(lease) = leases.get(&request.page_lease_id).cloned() else {
+    return Json(
+      serde_json::json!({ "ok": true, "released": false, "pageLeaseId": request.page_lease_id }),
+    )
+    .into_response();
+  };
+  if lease.profile_id != id
+    || lease.target_id != target_id
+    || lease.job_id != request.job_id
+    || lease.request_id != request.request_id
+    || lease.launch_generation != generation
+  {
+    return json_error_response(
+      StatusCode::CONFLICT,
+      "PAGE_LEASE_MISMATCH",
+      "page lease identity does not match the current browser generation",
+    );
+  }
+  leases.remove(&request.page_lease_id);
+  Json(serde_json::json!({ "ok": true, "released": true, "pageLeaseId": request.page_lease_id, "targetId": target_id })).into_response()
+}
+
+async fn local_browser_delete_page(Path((id, target_id)): Path<(String, String)>) -> Response {
+  let (profile, port, _pid, _generation) = match local_profile_identity(&id) {
+    Ok(value) => value,
+    Err(response) => return response,
+  };
+  let mut durable_owned = read_durable_managed_pages(&profile);
+  let is_managed = durable_owned.contains(&target_id)
+    || LOCAL_MANAGED_PAGES
+      .lock()
+      .await
+      .get(&id)
+      .is_some_and(|pages| pages.contains(&target_id));
+  if !is_managed {
+    return json_error_response(
+      StatusCode::FORBIDDEN,
+      "USER_PAGE_PROTECTED",
+      "only pages created by the local manager can be closed",
+    );
+  }
+  match crate::browser_runner::close_cdp_page(port, &target_id).await {
+    Ok(()) => {
+      durable_owned.remove(&target_id);
+      let _ = write_durable_managed_pages(&profile, &durable_owned);
+      if let Some(pages) = LOCAL_MANAGED_PAGES.lock().await.get_mut(&id) {
+        pages.remove(&target_id);
+      }
+      Json(serde_json::json!({ "ok": true, "targetId": target_id })).into_response()
+    }
+    Err(error) => json_error_response(StatusCode::BAD_GATEWAY, "CDP_PAGE_CLOSE_FAILED", error),
+  }
+}
+
+fn run_profile_error_response(status: StatusCode, body: String) -> Response {
+  let body = if body.trim().is_empty() {
+    serde_json::json!({
+      "error": {
+        "code": "INTERNAL_ERROR",
+        "stage": "RESPONSE_BUILD",
+        "message": "profile launch failed",
+        "retryable": status.is_server_error()
+      }
+    })
+    .to_string()
+  } else if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+    body
+  } else {
+    serde_json::json!({
+      "error": {
+        "code": "INTERNAL_ERROR",
+        "stage": "RESPONSE_BUILD",
+        "message": body,
+        "retryable": status.is_server_error()
+      }
+    })
+    .to_string()
+  };
+  let mut response = (status, body).into_response();
+  response.headers_mut().insert(
+    header::CONTENT_TYPE,
+    HeaderValue::from_static("application/json"),
+  );
+  response
+}
+
+fn target_binding_error_response(error: String) -> (StatusCode, String) {
+  if let Ok(value) = serde_json::from_str::<serde_json::Value>(&error) {
+    if let Some(code) = value
+      .pointer("/error/code")
+      .and_then(serde_json::Value::as_str)
+    {
+      let status = match code {
+        "TARGET_BINDING_PROFILE_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "TARGET_BINDING_REQUIRES_CHROMIUM" => StatusCode::BAD_REQUEST,
+        "TARGET_BINDING_PREPARE_FAILED"
+          if value
+            .pointer("/error/stage")
+            .and_then(serde_json::Value::as_str)
+            == Some("PROFILE_VALIDATION") =>
+        {
+          StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+      };
+      return (status, error);
+    }
+  }
+  let code = error
+    .split(':')
+    .next()
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or("TARGET_BINDING_FAILED");
+  let (stage, message) = if code == "TARGET_BINDING_PREPARE_FAILED" {
+    let mut parts = error.splitn(4, ':');
+    let _ = parts.next();
+    let _ = parts.next();
+    let stage = parts
+      .next()
+      .filter(|value| !value.is_empty())
+      .unwrap_or("PREPARE");
+    let message = parts.next().unwrap_or(&error).trim_start_matches(':');
+    (stage.to_string(), message.to_string())
+  } else {
+    (target_binding_stage(code).to_string(), error.clone())
+  };
+  let status = match code {
+    "TARGET_BINDING_PROFILE_NOT_FOUND" => StatusCode::NOT_FOUND,
+    "TARGET_BINDING_PROFILE_RUNNING"
+    | "TARGET_BINDING_SESSION_NOT_FOUND"
+    | "TARGET_BINDING_SESSION_EXPIRED"
+    | "TARGET_BINDING_RESPONSE_NOT_RECOVERABLE"
+    | "TARGET_BINDING_IDENTITY_CHANGED"
+    | "TARGET_BINDING_PROFILE_MISMATCH"
+    | "TARGET_BINDING_HANDLE_INVALID"
+    | "TARGET_BINDING_HANDLE_STALE" => StatusCode::CONFLICT,
+    "TARGET_BINDING_REQUIRES_CHROMIUM" => StatusCode::BAD_REQUEST,
+    _ => StatusCode::INTERNAL_SERVER_ERROR,
+  };
+  (
+    status,
+    serde_json::json!({
+      "error": {
+        "code": code,
+        "message": message,
+        "stage": stage,
+        "retryable": status.is_server_error()
+      }
+    })
+    .to_string(),
+  )
+}
+
+fn target_binding_stage(code: &str) -> &'static str {
+  match code {
+    "TARGET_BINDING_REQUIRES_CHROMIUM"
+    | "TARGET_BINDING_PROFILE_NOT_FOUND"
+    | "TARGET_BINDING_PROFILE_MISMATCH" => "PROFILE_VALIDATION",
+    "TARGET_BINDING_PROFILE_RUNNING" => "TEMP_BINDING_TRANSITION",
+    "TARGET_BINDING_RESPONSE_NOT_RECOVERABLE" | "TARGET_BINDING_SESSION_EXPIRED" => "RECOVERY",
+    "TARGET_BINDING_CANDIDATES_NOT_FOUND" => "CANDIDATE_DISCOVERY",
+    "TARGET_BINDING_CDP_PORT_MISSING" | "TARGET_BINDING_BROWSER_IDENTITY_MISSING" => {
+      "CDP_READINESS"
+    }
+    "TARGET_BINDING_PROCESS_SPAWN_FAILED" | "TARGET_BINDING_PROCESS_POST_SPAWN_FAILED" => {
+      "PROCESS_SPAWN"
+    }
+    "TARGET_BINDING_CDP_READINESS_FAILED" => "CDP_READINESS",
+    "TARGET_BINDING_CHECKPOINT_FAILED" => "CHECKPOINT_CAPTURE",
+    "TARGET_BINDING_RESPONSE_BUILD_FAILED" => "RESPONSE_BUILD",
+    "TARGET_BINDING_HANDLE_INVALID" | "TARGET_BINDING_HANDLE_STALE" => "CANDIDATE_DISCOVERY",
+    "TARGET_BINDING_TASK_PANICKED" => "TASK_BOUNDARY",
+    _ => "PREPARE",
+  }
+}
+
+fn target_binding_http_response(status: StatusCode, body: String) -> Response {
+  let body = if body.trim().is_empty() {
+    serde_json::json!({
+      "error": {
+        "code": "TARGET_BINDING_TASK_FAILED",
+        "stage": "RESPONSE_BUILD",
+        "message": "target binding request failed without an error body",
+        "retryable": status.is_server_error()
+      }
+    })
+    .to_string()
+  } else if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+    body
+  } else {
+    target_binding_error_response(body).1
+  };
+  let mut response = (status, body).into_response();
+  response.headers_mut().insert(
+    header::CONTENT_TYPE,
+    HeaderValue::from_static("application/json"),
+  );
+  response
+}
+
+fn target_binding_request_invalid_body(message: &str) -> String {
+  serde_json::json!({
+    "error": {
+      "code": "TARGET_BINDING_REQUEST_INVALID",
+      "stage": "REQUEST_VALIDATION",
+      "message": message,
+      "retryable": false
+    }
+  })
+  .to_string()
+}
+
+fn target_binding_request_invalid_response(message: &str) -> Response {
+  target_binding_http_response(
+    StatusCode::BAD_REQUEST,
+    target_binding_request_invalid_body(message),
+  )
+}
+
+/// Normalize every non-panic prepare failure to the typed error contract. The
+/// binding service historically returned plain strings (and, in one path, an
+/// empty body), so the route owns the final envelope while preserving the
+/// original safe code/message for diagnosis.
+fn target_binding_prepare_error_body(profile_id: &str, status: StatusCode, body: &str) -> String {
+  let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+  let original_code = parsed
+    .as_ref()
+    .and_then(|value| value.pointer("/error/code").or_else(|| value.get("code")))
+    .and_then(serde_json::Value::as_str)
+    .or_else(|| {
+      body
+        .split(':')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+    })
+    .unwrap_or("TARGET_BINDING_FAILED");
+  let message = parsed
+    .as_ref()
+    .and_then(|value| {
+      value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+    })
+    .and_then(serde_json::Value::as_str)
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| {
+      let value = body.trim();
+      if value.is_empty() {
+        "target binding preparation failed"
+      } else {
+        value
+      }
+    });
+  let stage = parsed
+    .as_ref()
+    .and_then(|value| value.pointer("/error/stage").or_else(|| value.get("stage")))
+    .and_then(serde_json::Value::as_str)
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| target_binding_stage(original_code));
+  let bool_field = |name: &str| {
+    parsed
+      .as_ref()
+      .and_then(|value| {
+        value
+          .pointer(&format!("/error/{name}"))
+          .or_else(|| value.get(name))
+      })
+      .and_then(serde_json::Value::as_bool)
+      .unwrap_or(false)
+  };
+  serde_json::json!({
+    "error": {
+      "code": "TARGET_BINDING_PREPARE_FAILED",
+      "stage": stage,
+      "message": message,
+      "profileId": profile_id,
+      "processSpawned": bool_field("processSpawned"),
+      "rollbackAttempted": bool_field("rollbackAttempted"),
+      "rollbackSucceeded": bool_field("rollbackSucceeded"),
+      "retryable": parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/retryable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(status.is_server_error()),
+      "details": {
+        "originalCode": original_code
+      }
+    }
+  })
+  .to_string()
+}
+
+#[utoipa::path(
+  post,
+  path = "/v1/profiles/{id}/target-binding/prepare",
+  params(("id" = String, Path, description = "Profile ID")),
+  responses(
+    (status = 200, description = "Explicit target binding candidates", body = crate::browser_runner::TargetBindingPrepareResponse),
+    (status = 400, description = "Profile does not use CFT"),
+    (status = 404, description = "Profile not found"),
+    (status = 409, description = "Profile is already running"),
+    (status = 500, description = "Binding preparation failed")
+  ),
+  security(("bearer_auth" = [])),
+  tag = "profiles"
+)]
+async fn prepare_target_binding(
+  Path(id): Path<String>,
+  State(state): State<ApiServerState>,
+) -> Response {
+  let profile_id_for_error = id.clone();
+  let result = std::panic::AssertUnwindSafe(async move {
+    if state.runtime_kind != "floword-donut-runtime"
+      && !crate::cloud_auth::CLOUD_AUTH
+        .can_use_browser_automation()
+        .await
+    {
+      return Err((
+        StatusCode::PAYMENT_REQUIRED,
+        "browser automation is not available".into(),
+      ));
+    }
+    let profile = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+      .into_iter()
+      .find(|profile| profile.id.to_string() == id)
+      .ok_or_else(|| {
+        (
+          StatusCode::NOT_FOUND,
+          "TARGET_BINDING_PROFILE_NOT_FOUND".into(),
+        )
+      })?;
+    if profile.is_cross_os() {
+      return Err((
+        StatusCode::BAD_REQUEST,
+        "cross-OS profile cannot be launched".into(),
+      ));
+    }
+    crate::browser_runner::BrowserRunner::instance()
+      .prepare_managed_grok_binding(state.app_handle.clone(), profile)
+      .await
+      .map(Json)
+      .map_err(target_binding_error_response)
+  })
+  .catch_unwind()
+  .await;
+  match result {
+    Ok(Ok(Json(body))) => Json(body).into_response(),
+    Ok(Err((status, body))) => target_binding_http_response(
+      status,
+      target_binding_prepare_error_body(&profile_id_for_error, status, &body),
+    ),
+    Err(_) => target_binding_http_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      serde_json::json!({
+        "error": {
+          "code": "TARGET_BINDING_TASK_PANICKED",
+          "stage": "TASK_BOUNDARY",
+          "message": "target binding task panicked",
+          "retryable": false
+        }
+      })
+      .to_string(),
+    ),
+  }
+}
+
+#[utoipa::path(
+  get,
+  path = "/v1/profiles/{id}/target-binding/pending",
+  params(("id" = String, Path, description = "Profile ID")),
+  responses(
+    (status = 200, description = "Durable pending target binding", body = crate::browser_runner::TargetBindingPrepareResponse),
+    (status = 404, description = "Profile not found"),
+    (status = 409, description = "Pending binding cannot be resumed")
+  ),
+  security(("bearer_auth" = [])),
+  tag = "profiles"
+)]
+async fn pending_target_binding(Path(id): Path<String>) -> Response {
+  let result = crate::browser_runner::BrowserRunner::instance()
+    .resume_managed_grok_binding(&id)
+    .await;
+  match result {
+    Ok(response) => Json(response).into_response(),
+    Err(error) => {
+      let (status, body) = target_binding_error_response(error);
+      target_binding_http_response(status, body)
+    }
+  }
+}
+
+#[utoipa::path(
+  post,
+  path = "/v1/profiles/{id}/target-binding/confirm",
+  params(("id" = String, Path, description = "Profile ID")),
+  request_body = TargetBindingConfirmRequest,
+  responses(
+    (status = 200, description = "Managed target binding committed", body = crate::browser_runner::TargetBindingConfirmResponse),
+    (status = 409, description = "Binding session or handle is stale"),
+    (status = 500, description = "Binding confirmation failed")
+  ),
+  security(("bearer_auth" = [])),
+  tag = "profiles"
+)]
+async fn confirm_target_binding(
+  Path(id): Path<String>,
+  State(_state): State<ApiServerState>,
+  request: Result<Json<TargetBindingConfirmRequest>, JsonRejection>,
+) -> Response {
+  let request = match request {
+    Ok(Json(request)) => request,
+    Err(_) => {
+      return target_binding_request_invalid_response(
+        "binding_session_id and handle are required snake_case fields",
+      )
+    }
+  };
+  if uuid::Uuid::parse_str(&request.binding_session_id).is_err() {
+    return target_binding_request_invalid_response("binding_session_id must be a valid UUID");
+  }
+  let result = std::panic::AssertUnwindSafe(async move {
+    let profile_id = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+      .into_iter()
+      .find(|profile| profile.id.to_string() == id)
+      .map(|profile| profile.id.to_string())
+      .ok_or_else(|| {
+        (
+          StatusCode::NOT_FOUND,
+          "TARGET_BINDING_PROFILE_NOT_FOUND".into(),
+        )
+      })?;
+    let session_profile =
+      crate::browser_runner::binding_session_profile_id(&request.binding_session_id)
+        .await
+        .map_err(target_binding_error_response)?;
+    if session_profile != profile_id {
+      return Err(target_binding_error_response(
+        "TARGET_BINDING_PROFILE_MISMATCH".into(),
+      ));
+    }
+    crate::browser_runner::BrowserRunner::instance()
+      .confirm_managed_grok_binding(&request.binding_session_id, &request.handle)
+      .await
+      .map(Json)
+      .map_err(target_binding_error_response)
+  })
+  .catch_unwind()
+  .await;
+  match result {
+    Ok(Ok(Json(body))) => Json(body).into_response(),
+    Ok(Err((status, body))) => target_binding_http_response(status, body),
+    Err(_) => target_binding_http_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      serde_json::json!({
+        "error": {
+          "code": "TARGET_BINDING_TASK_PANICKED",
+          "stage": "TASK_BOUNDARY",
+          "message": "target binding task panicked",
+          "retryable": false
+        }
+      })
+      .to_string(),
+    ),
+  }
+}
+
+#[utoipa::path(
+  post,
+  path = "/v1/profiles/{id}/target-binding/abort",
+  params(("id" = String, Path, description = "Profile ID")),
+  request_body = TargetBindingSessionRequest,
+  responses(
+    (status = 200, description = "Binding aborted", body = crate::browser_runner::TargetBindingAbortResponse),
+    (status = 409, description = "Binding session is stale"),
+    (status = 500, description = "Binding abort failed")
+  ),
+  security(("bearer_auth" = [])),
+  tag = "profiles"
+)]
+async fn abort_target_binding(
+  Path(id): Path<String>,
+  State(_state): State<ApiServerState>,
+  request: Result<Json<TargetBindingSessionRequest>, JsonRejection>,
+) -> Response {
+  let request = match request {
+    Ok(Json(request)) => request,
+    Err(_) => {
+      return target_binding_request_invalid_response(
+        "binding_session_id is required and must be valid JSON",
+      )
+    }
+  };
+  let result = std::panic::AssertUnwindSafe(async move {
+    let profile_id = crate::browser_runner::binding_session_profile_id(&request.binding_session_id)
+      .await
+      .map_err(target_binding_error_response)?;
+    if profile_id != id {
+      return Err(target_binding_error_response(
+        "TARGET_BINDING_PROFILE_MISMATCH".into(),
+      ));
+    }
+    crate::browser_runner::BrowserRunner::instance()
+      .abort_managed_grok_binding(&request.binding_session_id)
+      .await
+      .map(Json)
+      .map_err(target_binding_error_response)
+  })
+  .catch_unwind()
+  .await;
+  match result {
+    Ok(Ok(Json(body))) => Json(body).into_response(),
+    Ok(Err((status, body))) => target_binding_http_response(status, body),
+    Err(_) => target_binding_http_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      serde_json::json!({
+        "error": {
+          "code": "TARGET_BINDING_TASK_PANICKED",
+          "stage": "TASK_BOUNDARY",
+          "message": "target binding task panicked",
+          "retryable": false
+        }
+      })
+      .to_string(),
+    ),
+  }
+}
+
+async fn run_profile_inner(
+  id: String,
+  state: ApiServerState,
+  headers: HeaderMap,
+  request: RunProfileRequest,
+  enforce_entitlement: bool,
 ) -> Result<Json<RunProfileResponse>, (StatusCode, String)> {
-  if state.runtime_kind != "floword-donut-runtime"
+  let request_id = headers
+    .get("X-Floword-Request-Id")
+    .and_then(|value| value.to_str().ok())
+    .unwrap_or("unknown");
+  log_run_phase(request_id, "RUN_HANDLER_ENTERED", &id, None, None);
+  if enforce_entitlement
+    && state.runtime_kind != "floword-donut-runtime"
     && !crate::cloud_auth::CLOUD_AUTH
       .can_use_browser_automation()
       .await
@@ -2436,6 +4223,13 @@ async fn run_profile(
     .iter()
     .find(|p| p.id.to_string() == id)
     .ok_or((StatusCode::NOT_FOUND, "profile not found".to_string()))?;
+  log_run_phase(
+    request_id,
+    "PROFILE_RESOLVED",
+    &id,
+    profile.process_id,
+    profile.last_launch,
+  );
 
   if profile.is_cross_os() {
     return Err((
@@ -2458,6 +4252,19 @@ async fn run_profile(
   } else {
     crate::browser_runner::LaunchUrlPolicy::AlwaysOpen(request.url)
   };
+  // Older callers may omit browser_engine. A persisted Chromium profile must
+  // still launch through the CFT/Chromium path instead of falling back to the
+  // historical Wayfern default.
+  let requested_engine = match request.browser_engine.as_deref() {
+    Some(value) => Some(
+      crate::browser::BrowserType::from_str(value)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?,
+    ),
+    None if profile.browser.eq_ignore_ascii_case("chromium") => {
+      Some(crate::browser::BrowserType::Chromium)
+    }
+    None => None,
+  };
   let launch_result = match crate::browser_runner::launch_browser_profile_impl_with_policy_result(
     state.app_handle.clone(),
     profile.clone(),
@@ -2465,6 +4272,7 @@ async fn run_profile(
     None,
     headless,
     false,
+    requested_engine.clone(),
   )
   .await
   {
@@ -2477,17 +4285,61 @@ async fn run_profile(
   let crate::browser_runner::FlowordLaunchResult {
     profile: updated_profile,
     reused,
+    remote_debugging_port,
+    grok_target_id,
+    grok_page_url,
+    grok_target_reused,
+    target_selection_source,
   } = launch_result;
+  log_run_phase(
+    request_id,
+    "BROWSER_IDENTITY_RESOLVED",
+    &id,
+    updated_profile.process_id,
+    updated_profile.last_launch,
+  );
   let profiles_dir = ProfileManager::instance().get_profiles_dir();
   let profile_path = updated_profile.get_profile_data_path(&profiles_dir);
   let profile_path_str = profile_path.to_string_lossy();
-  let cdp_port = crate::wayfern_manager::WayfernManager::instance()
-    .get_cdp_port(&profile_path_str)
-    .await
-    .unwrap_or(0);
+  let cdp_port = if let Some(port) = remote_debugging_port {
+    port
+  } else {
+    crate::wayfern_manager::WayfernManager::instance()
+      .get_cdp_port(&profile_path_str)
+      .await
+      .unwrap_or(0)
+  };
+  let browser_executable = if requested_engine == Some(crate::browser::BrowserType::Chromium) {
+    crate::browser::ChromiumBrowser::resolve_executable().ok()
+  } else {
+    None
+  };
 
+  log_run_phase(
+    request_id,
+    "RUN_HANDLER_RETURNING",
+    &id,
+    updated_profile.process_id,
+    updated_profile.last_launch,
+  );
   Ok(Json(RunProfileResponse {
     profile_id: profile.id.to_string(),
+    browser_engine: requested_engine
+      .as_ref()
+      .map(|engine| engine.canonical_engine_name().to_string())
+      .unwrap_or_else(|| "WAYFERN".to_string()),
+    browser_version: if browser_executable.is_some() {
+      std::env::var("FLOWORD_CHROMIUM_VERSION")
+        .ok()
+        .or_else(|| Some("staged".to_string()))
+    } else {
+      None
+    },
+    browser_executable: browser_executable.map(|path| path.to_string_lossy().to_string()),
+    grok_target_id,
+    grok_page_url,
+    grok_target_reused,
+    target_selection_source,
     remote_debugging_port: cdp_port,
     headless,
     browser_pid: updated_profile.process_id,
@@ -2502,22 +4354,76 @@ fn profile_launch_error_response(profile_id: &str, raw: String) -> (StatusCode, 
     .as_ref()
     .and_then(|v| v.get("code"))
     .and_then(|v| v.as_str())
+    .filter(|value| !value.trim().is_empty())
     .or_else(|| raw.split(':').next())
+    .filter(|value| !value.trim().is_empty())
     .unwrap_or("INTERNAL_ERROR")
     .to_string();
-  let detail = parsed
+  let raw_detail = parsed
     .as_ref()
     .and_then(|v| v.get("params"))
     .and_then(|v| v.get("detail"))
     .and_then(|v| v.as_str())
-    .unwrap_or_else(|| raw.trim());
-  let stage = match code.as_str() {
-    "PROXY_BROWSER_PID_BIND_FAILED" => "PROXY_BROWSER_PID_BIND",
-    "PROXY_START_FAILED" | "XRAY_START_FAILED" => "PROXY_START",
-    "WAYFERN_LAUNCH_FAILED" => "WAYFERN_LAUNCH",
-    "PROFILE_PROCESS_PERSIST_FAILED" => "PROFILE_PROCESS_PERSIST",
-    _ => "PROFILE_LAUNCH",
-  };
+    .filter(|value| !value.trim().is_empty())
+    .or_else(|| {
+      let trimmed = raw.trim();
+      (!trimmed.is_empty()).then_some(trimmed)
+    })
+    .unwrap_or("profile launch failed");
+  // Post-spawn reconciliation may carry a structured inner target error in
+  // params.detail.  Unwrap it here so the outer HTTP envelope preserves the
+  // real message/stage and sanitized candidate diagnostics.
+  let inner = serde_json::from_str::<serde_json::Value>(raw_detail).ok();
+  let detail = inner
+    .as_ref()
+    .and_then(|value| value.get("message"))
+    .and_then(|value| value.as_str())
+    .unwrap_or(raw_detail)
+    .to_string();
+  let details = parsed
+    .as_ref()
+    .and_then(|v| {
+      v.get("details")
+        .or_else(|| v.get("params").and_then(|p| p.get("details")))
+    })
+    .cloned()
+    .unwrap_or_else(|| serde_json::json!({}));
+  let mut details = details;
+  if let Some(inner_details) = inner.as_ref().and_then(|value| value.get("details")) {
+    if let (Some(target), Some(source)) = (details.as_object_mut(), inner_details.as_object()) {
+      for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+      }
+    }
+  }
+  let stage = parsed
+    .as_ref()
+    .and_then(|v| v.get("stage"))
+    .and_then(|value| value.as_str())
+    .or_else(|| {
+      inner
+        .as_ref()
+        .and_then(|v| v.get("stage"))
+        .and_then(|value| value.as_str())
+    })
+    .or_else(|| {
+      parsed
+        .as_ref()
+        .and_then(|v| v.get("details"))
+        .and_then(|v| v.get("stage"))
+        .and_then(|value| value.as_str())
+    })
+    .unwrap_or(match code.as_str() {
+      "PROXY_BROWSER_PID_BIND_FAILED" => "PROXY_BROWSER_PID_BIND",
+      "PROXY_START_FAILED" | "XRAY_START_FAILED" => "PROXY_START",
+      "WAYFERN_LAUNCH_FAILED" => "WAYFERN_LAUNCH",
+      "PROFILE_PROCESS_PERSIST_FAILED" => "PROFILE_PROCESS_PERSIST",
+      "GROK_TARGET_NAVIGATION_FAILED"
+      | "GROK_TARGET_NAVIGATION_UNKNOWN"
+      | "GROK_COLD_START_NAVIGATION_FAILED" => "ENSURE_GROK_TARGET",
+      "RUN_POST_SPAWN_RECONCILE_FAILED" => "RUN_POST_SPAWN_RECONCILE",
+      _ => "PROFILE_LAUNCH",
+    });
   let status = match code.as_str() {
     "PROFILE_RUNNING" | "PROFILE_LAUNCH_IN_PROGRESS" => StatusCode::CONFLICT,
     "PROXY_START_FAILED" | "PROXY_BROWSER_PID_BIND_FAILED" => StatusCode::SERVICE_UNAVAILABLE,
@@ -2527,15 +4433,22 @@ fn profile_launch_error_response(profile_id: &str, raw: String) -> (StatusCode, 
     status,
     StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
   );
-  let body = serde_json::json!({
-    "error": {
-      "code": code,
-      "message": detail,
-      "stage": stage,
-      "profileId": profile_id,
-      "retryable": retryable
-    }
+  let mut error = serde_json::json!({
+    "code": code,
+    "message": detail,
+    "stage": stage,
+    "profileId": profile_id,
+    "retryable": retryable,
+    "details": details.clone()
   });
+  if let Some(object) = error.as_object_mut() {
+    for key in ["processSpawned", "rollbackAttempted", "rollbackSucceeded"] {
+      if let Some(value) = details.get(key) {
+        object.insert(key.to_string(), value.clone());
+      }
+    }
+  }
+  let body = serde_json::json!({ "error": error });
   (status, body.to_string())
 }
 
@@ -2825,7 +4738,7 @@ async fn open_url_in_profile(
     ("id" = String, Path, description = "Profile ID")
   ),
   responses(
-    (status = 204, description = "Browser process killed successfully"),
+    (status = 200, description = "Browser process stopped successfully", body = crate::browser_runner::StopBrowserResult),
     (status = 401, description = "Unauthorized"),
     (status = 402, description = "Active paid plan required"),
     (status = 404, description = "Profile not found"),
@@ -2840,35 +4753,68 @@ async fn open_url_in_profile(
 async fn kill_profile(
   Path(id): Path<String>,
   State(state): State<ApiServerState>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<crate::browser_runner::StopBrowserResult>, (StatusCode, String)> {
   // Programmatically launching and stopping profiles is a paid feature; the
   // run/open-url handlers gate the same way.
   if !crate::cloud_auth::CLOUD_AUTH
     .can_use_browser_automation()
     .await
   {
-    return Err(StatusCode::PAYMENT_REQUIRED);
+    return Err((
+      StatusCode::PAYMENT_REQUIRED,
+      serde_json::json!({"error":{"code":"PAYMENT_REQUIRED","message":"browser automation is not available for this account"}}).to_string(),
+    ));
   }
 
   let profile_manager = ProfileManager::instance();
-  let profiles = profile_manager
-    .list_profiles()
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+  let profiles = profile_manager.list_profiles().map_err(|error| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      serde_json::json!({"error":{"code":"INTERNAL_ERROR","message":error.to_string()}})
+        .to_string(),
+    )
+  })?;
 
   let profile = profiles
     .iter()
     .find(|p| p.id.to_string() == id)
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .ok_or_else(|| {
+      (
+        StatusCode::NOT_FOUND,
+        serde_json::json!({"error":{"code":"PROFILE_NOT_FOUND","message":"profile not found"}})
+          .to_string(),
+      )
+    })?;
 
   let browser_runner = crate::browser_runner::BrowserRunner::instance();
-  browser_runner
-    .kill_browser_process(state.app_handle.clone(), profile)
+  let result = browser_runner
+    .stop_browser_process_with_result(state.app_handle.clone(), profile)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|error| {
+      let raw = error.to_string();
+      let code = match raw.as_str() {
+        "PROFILE_BUSY" => "PROFILE_BUSY",
+        "BROWSER_SESSION_IDENTITY_MISMATCH" => "BROWSER_SESSION_IDENTITY_MISMATCH",
+        "BROWSER_SESSION_NOT_MANAGED" => "BROWSER_SESSION_NOT_MANAGED",
+        _ => "BROWSER_STOP_FAILED",
+      };
+      let status = if matches!(
+        code,
+        "PROFILE_BUSY" | "BROWSER_SESSION_IDENTITY_MISMATCH" | "BROWSER_SESSION_NOT_MANAGED"
+      ) {
+        StatusCode::CONFLICT
+      } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+      };
+      (
+        status,
+        serde_json::json!({"error":{"code":code,"message":raw}}).to_string(),
+      )
+    })?;
 
   crate::team_lock::release_team_lock_if_needed(profile).await;
 
-  Ok(StatusCode::NO_CONTENT)
+  Ok(Json(result))
 }
 
 // API Handler - Batch run profiles (paid: browser automation). Mirrors the
@@ -3292,11 +5238,289 @@ async fn check_browser_downloaded(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use axum::body::Body;
+  use axum::http::Request;
+  use http_body_util::BodyExt;
+  use serde_json::json;
+  use std::process::{Command, Stdio};
+  use tempfile::TempDir;
+  use tokio::time::{sleep, Duration};
+  use tower::ServiceExt;
+  use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+  fn write_pending_binding_fixture(
+    root: &std::path::Path,
+    profile_id: uuid::Uuid,
+    session_id: &str,
+    pid: u32,
+    cdp_port: u16,
+    generation: u64,
+    executable: &std::path::Path,
+    user_data_dir: &std::path::Path,
+  ) -> (std::path::PathBuf, std::path::PathBuf) {
+    let profile_root = root.join("profiles").join(profile_id.to_string());
+    let profile_data = profile_root.join("profile");
+    std::fs::create_dir_all(&profile_data).unwrap();
+    std::fs::write(
+      profile_root.join("metadata.json"),
+      serde_json::to_vec_pretty(&json!({
+        "id": profile_id,
+        "name": "pending-test",
+        "browser": "chromium",
+        "version": "test",
+        "process_id": pid,
+        "last_launch": generation,
+        "release_type": "stable"
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+    let candidate = |handle: &str, target_id: &str| {
+      json!({
+        "handle": handle,
+        "targetId": target_id,
+        "targetIdHash": format!("hash-{target_id}"),
+        "normalizedUrl": "https://grok.com/imagine",
+        "hostname": "grok.com",
+        "normalizedPath": "/imagine",
+        "titleHash": format!("title-{target_id}")
+      })
+    };
+    let ledger = json!({
+      "profileId": profile_id,
+      "managedTargetBindingId": session_id,
+      "lastKnownTargetId": "PENDING",
+      "browserPid": pid,
+      "cdpPort": cdp_port,
+      "launchGeneration": generation,
+      "managedGrokPageUrl": "https://grok.com/imagine",
+      "bindingCreatedAt": 1,
+      "bindingVersion": 1,
+      "lifecycle": "BINDING_REQUIRED",
+      "executable": executable,
+      "userDataDir": user_data_dir,
+      "expiresAt": 4_000_000_000u64,
+      "candidates": [candidate("handle-one", "target-one"), candidate("handle-two", "target-two")],
+      "previousLedger": null
+    });
+    let ledger_path = profile_data.join("floword-managed-target-binding.json");
+    let receipt_path = profile_data.join("floword-chromium-launch-receipt.json");
+    std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    std::fs::write(
+      &receipt_path,
+      serde_json::to_vec_pretty(&json!({
+        "profileId": profile_id,
+        "browserPid": pid,
+        "cdpPort": cdp_port,
+        "launchGeneration": generation,
+        "executable": executable,
+        "userDataDir": user_data_dir,
+        "spawnedAt": 1
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+    (ledger_path, receipt_path)
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  #[serial_test::serial]
+  async fn pending_binding_router_resumes_exact_durable_handles_idempotently() {
+    let root = TempDir::new().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(root.path().to_path_buf());
+    let profile_id = uuid::Uuid::new_v4();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let generation = 7;
+    let cdp = MockServer::start().await;
+    let cdp_port = cdp.address().port();
+    Mock::given(method("GET"))
+      .and(wiremock::matchers::path("/json/list"))
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+        {"id":"target-one","type":"page","url":"https://grok.com/imagine","title":"Imagine","webSocketDebuggerUrl":"ws://127.0.0.1/one"},
+        {"id":"target-two","type":"page","url":"https://grok.com/imagine","title":"Imagine","webSocketDebuggerUrl":"ws://127.0.0.1/two"}
+      ])))
+      .expect(1)
+      .mount(&cdp)
+      .await;
+
+    let profile_data = root
+      .path()
+      .join("profiles")
+      .join(profile_id.to_string())
+      .join("profile");
+    let user_data_dir = profile_data.join("floword-chromium");
+    // Use a private copy so the synthetic process has an executable path that
+    // exactly matches the durable receipt, just like a staged CFT launch.
+    // This keeps the identity check exercised without depending on a browser
+    // binary being installed on the test host.
+    let powershell =
+      std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()))
+        .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let executable = root.path().join("synthetic-cft.exe");
+    std::fs::copy(&powershell, &executable).unwrap();
+    let user_arg = format!("--user-data-dir={}", user_data_dir.display());
+    let port_arg = format!("--remote-debugging-port={cdp_port}");
+    let mut child = Command::new(&executable)
+      .args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+      ])
+      .arg(&user_arg)
+      .arg(&port_arg)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .unwrap();
+    sleep(Duration::from_millis(150)).await;
+    let (ledger_path, receipt_path) = write_pending_binding_fixture(
+      root.path(),
+      profile_id,
+      &session_id,
+      child.id(),
+      cdp_port,
+      generation,
+      &executable,
+      &user_data_dir,
+    );
+    crate::browser_runner::clear_target_binding_session_for_test(&session_id).await;
+
+    let app = Router::new().route(
+      "/v1/profiles/{id}/target-binding/pending",
+      get(pending_target_binding),
+    );
+    let uri = format!("/v1/profiles/{profile_id}/target-binding/pending");
+    let request = || Request::builder().uri(&uri).body(Body::empty()).unwrap();
+    let response_one = app.clone().oneshot(request()).await.unwrap();
+    let status_one = response_one.status();
+    let content_type_one = response_one
+      .headers()
+      .get(header::CONTENT_TYPE)
+      .and_then(|value| value.to_str().ok())
+      .map(str::to_string);
+    let body_one = response_one.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+      status_one,
+      StatusCode::OK,
+      "pending response body: {}",
+      String::from_utf8_lossy(&body_one)
+    );
+    assert_eq!(content_type_one.as_deref(), Some("application/json"));
+    let value_one: serde_json::Value = serde_json::from_slice(&body_one).unwrap();
+    assert_eq!(value_one["binding_session_id"], session_id);
+    assert_eq!(value_one["browser_pid"], child.id());
+    assert_eq!(value_one["remote_debugging_port"], cdp_port);
+    assert_eq!(value_one["launch_generation"], generation);
+    assert_eq!(value_one["candidate_count"], 2);
+    assert_eq!(value_one["candidates"][0]["handle"], "handle-one");
+    assert_eq!(
+      value_one["candidates"][0]["target_id_hash"],
+      "hash-target-one"
+    );
+    assert_eq!(
+      value_one["candidates"][0]["url"],
+      "https://grok.com/imagine"
+    );
+    assert_eq!(value_one["candidates"][1]["handle"], "handle-two");
+    assert_eq!(
+      value_one["candidates"][1]["target_id_hash"],
+      "hash-target-two"
+    );
+    let ledger_before = std::fs::read(&ledger_path).unwrap();
+
+    let response_two = app.oneshot(request()).await.unwrap();
+    let status_two = response_two.status();
+    let body_two = response_two.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+      status_two,
+      StatusCode::OK,
+      "second pending response body: {}",
+      String::from_utf8_lossy(&body_two)
+    );
+    let value_two: serde_json::Value = serde_json::from_slice(&body_two).unwrap();
+    assert_eq!(value_two, value_one);
+    assert_eq!(std::fs::read(&ledger_path).unwrap(), ledger_before);
+    assert!(receipt_path.exists());
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  #[serial_test::serial]
+  async fn pending_binding_router_keeps_invalid_receipts_pending_without_rollback() {
+    let root = TempDir::new().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(root.path().to_path_buf());
+    let executable = std::path::PathBuf::from("C:\\floword\\cft\\chrome.exe");
+    let user_data_dir = root.path().join("profile-data");
+    let app = Router::new().route(
+      "/v1/profiles/{id}/target-binding/pending",
+      get(pending_target_binding),
+    );
+
+    for (receipt_mode, expected_code) in [
+      ("mismatched", "TARGET_BINDING_RESPONSE_NOT_RECOVERABLE"),
+      ("missing", "TARGET_BINDING_RESPONSE_NOT_RECOVERABLE"),
+    ] {
+      let profile_id = uuid::Uuid::new_v4();
+      let session_id = uuid::Uuid::new_v4().to_string();
+      let (ledger_path, receipt_path) = write_pending_binding_fixture(
+        root.path(),
+        profile_id,
+        &session_id,
+        99999,
+        6550,
+        7,
+        &executable,
+        &user_data_dir,
+      );
+      if receipt_mode == "mismatched" {
+        std::fs::write(
+          &receipt_path,
+          serde_json::to_vec(&json!({
+            "profileId": profile_id,
+            "browserPid": 99998,
+            "cdpPort": 6550,
+            "launchGeneration": 7,
+            "executable": executable,
+            "userDataDir": user_data_dir,
+            "spawnedAt": 1
+          }))
+          .unwrap(),
+        )
+        .unwrap();
+      } else {
+        std::fs::remove_file(&receipt_path).unwrap();
+      }
+      let ledger_before = std::fs::read(&ledger_path).unwrap();
+      crate::browser_runner::clear_target_binding_session_for_test(&session_id).await;
+      let uri = format!("/v1/profiles/{profile_id}/target-binding/pending");
+      let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::CONFLICT);
+      let body = response.into_body().collect().await.unwrap().to_bytes();
+      let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+      assert_eq!(value["error"]["code"], expected_code);
+      assert_eq!(std::fs::read(&ledger_path).unwrap(), ledger_before);
+    }
+  }
 
   #[test]
   fn run_profile_response_exposes_reused_boolean() {
     let response = RunProfileResponse {
       profile_id: "profile".to_string(),
+      browser_engine: "CHROME_FOR_TESTING".to_string(),
+      browser_version: Some("test".to_string()),
+      browser_executable: None,
+      grok_target_id: None,
+      grok_page_url: None,
+      grok_target_reused: false,
+      target_selection_source: None,
       remote_debugging_port: 9223,
       headless: false,
       browser_pid: Some(42),
@@ -3307,6 +5531,135 @@ mod tests {
     assert_eq!(
       value.get("reused").and_then(serde_json::Value::as_bool),
       Some(true)
+    );
+  }
+
+  #[test]
+  fn profile_launch_errors_are_non_empty_and_preserve_structured_details() {
+    let (status, body) = profile_launch_error_response(
+      "profile-1",
+      serde_json::json!({
+        "code": "GROK_TARGET_NAVIGATION_FAILED",
+        "params": {
+          "detail": "navigation did not commit",
+          "details": {"targetIdHash": "abc", "phase": "ENSURE_GROK_TARGET"}
+        }
+      })
+      .to_string(),
+    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("JSON error envelope");
+    assert_eq!(value["error"]["code"], "GROK_TARGET_NAVIGATION_FAILED");
+    assert_eq!(value["error"]["message"], "navigation did not commit");
+    assert_eq!(value["error"]["stage"], "ENSURE_GROK_TARGET");
+    assert_eq!(value["error"]["profileId"], "profile-1");
+    assert_eq!(value["error"]["details"]["phase"], "ENSURE_GROK_TARGET");
+  }
+
+  #[test]
+  fn target_binding_errors_include_json_stage_and_non_empty_message() {
+    let (status, body) = target_binding_error_response(
+      "TARGET_BINDING_HANDLE_STALE: candidate target disappeared".into(),
+    );
+    assert_eq!(status, StatusCode::CONFLICT);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("JSON error envelope");
+    assert_eq!(value["error"]["code"], "TARGET_BINDING_HANDLE_STALE");
+    assert_eq!(value["error"]["stage"], "CANDIDATE_DISCOVERY");
+    assert_eq!(
+      value["error"]["message"],
+      "TARGET_BINDING_HANDLE_STALE: candidate target disappeared"
+    );
+    assert!(!body.trim().is_empty());
+  }
+
+  #[test]
+  fn prepare_failures_use_typed_json_contract() {
+    let body = target_binding_prepare_error_body(
+      "profile-1",
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "TARGET_BINDING_CDP_PORT_MISSING",
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("JSON error envelope");
+    assert_eq!(value["error"]["code"], "TARGET_BINDING_PREPARE_FAILED");
+    assert_eq!(value["error"]["stage"], "CDP_READINESS");
+    assert_eq!(value["error"]["profileId"], "profile-1");
+    assert!(value["error"].get("processSpawned").is_some());
+    assert!(value["error"].get("rollbackAttempted").is_some());
+    assert!(value["error"].get("rollbackSucceeded").is_some());
+    assert!(!value["error"]["message"].as_str().unwrap().is_empty());
+  }
+
+  #[test]
+  fn confirm_request_contract_requires_snake_case_fields() {
+    let valid = serde_json::from_str::<TargetBindingConfirmRequest>(
+      r#"{"binding_session_id":"00000000-0000-0000-0000-000000000001","handle":"h"}"#,
+    );
+    assert!(valid.is_ok());
+    let camel_case = serde_json::from_str::<TargetBindingConfirmRequest>(
+      r#"{"bindingSessionId":"00000000-0000-0000-0000-000000000001","candidateHandle":"h"}"#,
+    );
+    assert!(camel_case.is_err());
+    let missing_handle = serde_json::from_str::<TargetBindingConfirmRequest>(
+      r#"{"binding_session_id":"00000000-0000-0000-0000-000000000001"}"#,
+    );
+    assert!(missing_handle.is_err());
+    let replacement_only = serde_json::from_str::<TargetBindingConfirmRequest>(
+      r#"{"binding_session_id":"00000000-0000-0000-0000-000000000001","candidateHandle":"h"}"#,
+    );
+    assert!(replacement_only.is_err());
+    let value: serde_json::Value =
+      serde_json::from_str(&target_binding_request_invalid_body("invalid request"))
+        .expect("JSON rejection envelope");
+    assert_eq!(value["error"]["code"], "TARGET_BINDING_REQUEST_INVALID");
+    assert_eq!(value["error"]["stage"], "REQUEST_VALIDATION");
+    assert_eq!(value["error"]["retryable"], false);
+  }
+
+  #[test]
+  fn profile_launch_errors_never_return_an_empty_message() {
+    let (status, body) = profile_launch_error_response("profile-1", String::new());
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("JSON error envelope");
+    assert!(!value["error"]["message"].as_str().unwrap().is_empty());
+    assert_eq!(value["error"]["code"], "INTERNAL_ERROR");
+  }
+
+  #[test]
+  fn profile_launch_errors_promote_inner_target_diagnostics() {
+    let inner = serde_json::json!({
+      "code": "AMBIGUOUS_GROK_TAB",
+      "message": "multiple Grok page targets have no authoritative mapping",
+      "details": {
+        "grokCandidateCount": 2,
+        "candidateTargetIdHashes": ["a", "b"],
+        "selectionPath": "AMBIGUOUS_DISCOVERY"
+      }
+    });
+    let raw = serde_json::json!({
+      "code": "RUN_POST_SPAWN_RECONCILE_FAILED",
+      "stage": "GROK_TARGET_SELECTION",
+      "params": { "detail": inner.to_string() },
+      "details": { "browserPid": 42 }
+    });
+    let (_, body) = profile_launch_error_response("profile-1", raw.to_string());
+    let value: serde_json::Value = serde_json::from_str(&body).expect("JSON error envelope");
+    assert_eq!(value["error"]["message"], inner["message"]);
+    assert_eq!(value["error"]["stage"], "GROK_TARGET_SELECTION");
+    assert_eq!(value["error"]["details"]["grokCandidateCount"], 2);
+    assert_eq!(value["error"]["details"]["browserPid"], 42);
+  }
+
+  #[test]
+  fn middleware_error_response_is_json_and_non_empty() {
+    let response = json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "TEST_FAILURE", "boom");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+      response.headers().get(header::CONTENT_TYPE).unwrap(),
+      "application/json"
+    );
+    assert_eq!(
+      response.headers().get("x-floword-error-code").unwrap(),
+      "TEST_FAILURE"
     );
   }
   use crate::profile::types::{BrowserProfile, SyncMode};
@@ -3445,10 +5798,10 @@ mod tests {
 
   #[test]
   fn create_profile_request_ignores_unknown_fields() {
-    let json = r#"{"name": "p", "browser": "wayfern", "version": "latest", "future_field": true}"#;
+    let json = r#"{"name": "p", "browser": "chromium", "version": "latest", "future_field": true}"#;
     let parsed: CreateProfileRequest =
       serde_json::from_str(json).expect("unknown fields must be ignored, not rejected");
-    assert_eq!(parsed.browser, "wayfern");
+    assert_eq!(parsed.browser, "chromium");
   }
 
   #[test]
@@ -3456,10 +5809,10 @@ mod tests {
     // Minimal body: no version, no wayfern_config. Must
     // deserialize (version resolves to latest-downloaded at the handler; an
     // absent config triggers fresh-fingerprint generation).
-    let json = r#"{"name": "p", "browser": "wayfern"}"#;
+    let json = r#"{"name": "p", "browser": "chromium"}"#;
     let parsed: CreateProfileRequest =
       serde_json::from_str(json).expect("version and configs are optional");
-    assert_eq!(parsed.browser, "wayfern");
+    assert_eq!(parsed.browser, "chromium");
     assert!(parsed.version.is_none());
     assert!(parsed.wayfern_config.is_none());
   }
@@ -3468,9 +5821,9 @@ mod tests {
   fn create_profile_browser_validation_matches_supported_engines() {
     // The handler rejects anything that isn't a launchable engine; this is the
     // same predicate it uses, kept in lockstep with MCP's create_profile.
-    let is_valid = |b: &str| b == "wayfern";
-    assert!(is_valid("wayfern"));
-    assert!(!is_valid("chromium"));
+    let is_valid = |b: &str| b == "chromium";
+    assert!(is_valid("chromium"));
+    assert!(!is_valid("wayfern"));
     assert!(!is_valid(""));
   }
 

@@ -1,7 +1,7 @@
 use super::worker_registry::WORKER_REGISTRY;
 use super::worker_types::*;
 use axum::{
-  extract::Path,
+  extract::{rejection::JsonRejection, Path},
   http::StatusCode,
   response::{IntoResponse, Json},
   routing::{get, post},
@@ -9,10 +9,87 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+static PLAYWRIGHT_BOOTSTRAP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Starts the canonical Playwright worker bootstrap/heartbeat owner.  This is
+/// deliberately owned by the Donut runtime (not by acquire callers), so a
+/// restart can repopulate the registry before the first lease is requested.
+pub fn start_playwright_bootstrap_loop() {
+  if PLAYWRIGHT_BOOTSTRAP_RUNNING.swap(true, Ordering::AcqRel) {
+    log::info!("PLAYWRIGHT_BOOTSTRAP_SKIPPED reason=already_running");
+    return;
+  }
+  log::info!("PLAYWRIGHT_BOOTSTRAP_STARTED");
+
+  tauri::async_runtime::spawn(async {
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    loop {
+      ticker.tick().await;
+      let tick_started = std::time::Instant::now();
+      log::info!("PLAYWRIGHT_BOOTSTRAP_TICK");
+      let profiles = crate::profile::ProfileManager::instance()
+        .list_profiles()
+        .unwrap_or_default();
+      log::info!(
+        "PLAYWRIGHT_PROFILE_DISCOVERY profile_count={}",
+        profiles.len()
+      );
+      for profile in profiles.into_iter().filter(|p| p.process_id.is_some()) {
+        let request = AcquireWorkerRequest {
+          job_id: "__playwright_bootstrap__".to_string(),
+          step_id: "health".to_string(),
+          attempt_id: "bootstrap".to_string(),
+          capability: "grok.health".to_string(),
+          pool_id: profile.group_id.clone(),
+          profile_id: Some(profile.id.to_string()),
+          ttl_seconds: Some(120),
+        };
+        // ensure_playwright_worker is idempotent for a running Donut profile:
+        // it reuses the existing browser/CDP target and only refreshes the
+        // authoritative Sidecar health before upserting the stable worker id.
+        let has_playwright = WORKER_REGISTRY
+          .list_workers()
+          .await
+          .workers
+          .iter()
+          .any(|w| {
+            w.provider == WorkerProvider::Playwright && w.profile_id == profile.id.to_string()
+          });
+        log::info!(
+          "PLAYWRIGHT_HEALTH_PROBE profile_id={} registered={}",
+          profile.id,
+          has_playwright
+        );
+        log::info!("PLAYWRIGHT_ENSURE_STARTED profile_id={}", profile.id);
+        if let Err(error) =
+          ensure_playwright_worker(&profile.id.to_string(), &request, !has_playwright).await
+        {
+          log::warn!(
+            "Playwright bootstrap heartbeat failed profile_id={} error={}",
+            profile.id,
+            error
+          );
+          log::info!(
+            "PLAYWRIGHT_BOOTSTRAP_ERROR profile_id={} code=ENSURE_FAILED",
+            profile.id
+          );
+        } else {
+          log::info!("PLAYWRIGHT_ENSURE_COMPLETED profile_id={}", profile.id);
+        }
+      }
+      log::info!(
+        "PLAYWRIGHT_BOOTSTRAP_TICK_DONE elapsed_ms={}",
+        tick_started.elapsed().as_millis()
+      );
+    }
+  });
+}
 
 pub fn worker_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
   Router::new()
@@ -62,7 +139,7 @@ pub async fn acquire_worker_handler(
   Json(payload): Json<AcquireWorkerRequest>,
 ) -> Result<Json<AcquireWorkerResponse>, (StatusCode, Json<serde_json::Value>)> {
   if let Some(profile_id) = payload.profile_id.as_deref() {
-    if let Err(error) = ensure_playwright_worker(profile_id, &payload).await {
+    if let Err(error) = ensure_playwright_worker(profile_id, &payload, true).await {
       if std::env::var_os("FLOWORD_PLAYWRIGHT_RUNTIME_URL").is_some() {
         return Err(error_response(error));
       }
@@ -145,6 +222,7 @@ async fn preserve_http_error(
 async fn ensure_playwright_worker(
   profile_id: &str,
   req: &AcquireWorkerRequest,
+  launch_profile: bool,
 ) -> Result<(), super::worker_types::WorkerError> {
   let base = std::env::var("FLOWORD_PLAYWRIGHT_RUNTIME_URL")
     .unwrap_or_else(|_| "http://127.0.0.1:9223".to_string());
@@ -161,35 +239,61 @@ async fn ensure_playwright_worker(
   let run_body = serde_json::json!({
     "url": "https://grok.com/imagine",
     "headless": false,
-    "cold_start_only": true
+    "cold_start_only": true,
+    // The managed Grok profile is backed by the staged unbranded Chromium
+    // engine.  Omitting this field makes /run default to Wayfern, which then
+    // rejects the Chromium profile as an unsupported browser type.
+    "browser_engine": "CHROME_FOR_TESTING"
   });
-  let run = client
-    .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
-    .json(&run_body)
-    .send()
-    .await
-    .map_err(|e| {
+  let run_body: serde_json::Value = if launch_profile {
+    let run = client
+      .post(format!("{donut_base}/v1/profiles/{profile_id}/run"))
+      .json(&run_body)
+      .send()
+      .await
+      .map_err(|e| {
+        WorkerError::new(
+          WorkerErrorCode::BridgeDisconnected,
+          format!("Donut browser unavailable: {e}"),
+        )
+      })?;
+    if !run.status().is_success() {
+      return Err(
+        preserve_http_error(
+          run,
+          WorkerErrorCode::BridgeDisconnected,
+          "Donut profile run failed",
+        )
+        .await,
+      );
+    }
+    run.json().await.map_err(|e| {
       WorkerError::new(
-        WorkerErrorCode::BridgeDisconnected,
-        format!("Donut browser unavailable: {e}"),
+        WorkerErrorCode::InvalidHealthResponse,
+        format!("Invalid Donut run response: {e}"),
       )
-    })?;
-  if !run.status().is_success() {
-    return Err(
-      preserve_http_error(
-        run,
-        WorkerErrorCode::BridgeDisconnected,
-        "Donut profile run failed",
-      )
-      .await,
-    );
-  }
-  let run_body: serde_json::Value = run.json().await.map_err(|e| {
-    WorkerError::new(
-      WorkerErrorCode::InvalidHealthResponse,
-      format!("Invalid Donut run response: {e}"),
-    )
-  })?;
+    })?
+  } else {
+    let profiles = crate::profile::ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| WorkerError::new(WorkerErrorCode::InvalidHealthResponse, e.to_string()))?;
+    let profile = profiles
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| {
+        WorkerError::new(
+          WorkerErrorCode::InvalidProfile,
+          "Playwright profile not found",
+        )
+      })?;
+    let path =
+      profile.get_profile_data_path(&crate::profile::ProfileManager::instance().get_profiles_dir());
+    let cdp_port = crate::wayfern_manager::WayfernManager::instance()
+      .get_cdp_port(&path.to_string_lossy())
+      .await
+      .unwrap_or(0);
+    serde_json::json!({"remote_debugging_port": cdp_port, "browser_pid": profile.process_id, "launch_generation": profile.last_launch})
+  };
   let cdp_port = run_body
     .get("remote_debugging_port")
     .and_then(|v| v.as_u64())
@@ -432,13 +536,35 @@ pub async fn release_lease_handler(Path(lease_id): Path<String>) -> impl IntoRes
   if let Some(lease) = leases.leases.iter().find(|l| l.lease_id == lease_id) {
     let profile_id = lease.profile_id.clone();
     let worker_id = lease.worker_id.clone();
-    tauri::async_runtime::spawn(async move {
-      if let Ok(handshake) = probe_worker_health(&profile_id).await {
-        let _ = WORKER_REGISTRY
-          .handle_health_handshake(&worker_id, handshake)
-          .await;
-      }
-    });
+    // Playwright workers are reconciled through the Sidecar health contract.
+    // The legacy probe uses Wayfern/CDP dispatch and can overwrite the
+    // canonical Playwright record when both records share one profile.
+    if worker_id.starts_with("playwright-profile:") {
+      // Reconcile the canonical Playwright worker through its Sidecar health
+      // contract immediately. This keeps the worker quarantined until a
+      // fresh READY/IDLE response is observed, without invoking Wayfern.
+      let reconcile_profile = profile_id.clone();
+      tauri::async_runtime::spawn(async move {
+        let request = AcquireWorkerRequest {
+          job_id: "__reconcile__".to_string(),
+          step_id: "health".to_string(),
+          attempt_id: Uuid::new_v4().simple().to_string(),
+          capability: "grok.health".to_string(),
+          pool_id: None,
+          profile_id: Some(reconcile_profile.clone()),
+          ttl_seconds: Some(30),
+        };
+        let _ = ensure_playwright_worker(&reconcile_profile, &request, true).await;
+      });
+    } else {
+      tauri::async_runtime::spawn(async move {
+        if let Ok(handshake) = probe_worker_health(&profile_id).await {
+          let _ = WORKER_REGISTRY
+            .handle_health_handshake(&worker_id, handshake)
+            .await;
+        }
+      });
+    }
   }
 
   (StatusCode::OK, Json(res))
@@ -1327,10 +1453,76 @@ pub async fn probe_worker_health(
   })
 }
 
+fn dispatch_json_error_response(
+  code: &'static str,
+  message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+  (
+    StatusCode::BAD_REQUEST,
+    Json(serde_json::json!({
+      "protocol": "floword-production",
+      "protocolVersion": 1,
+      "ok": false,
+      "error": {
+        "code": code,
+        "message": message.into(),
+        "details": {"phase": "json_extraction"},
+        "retryable": false
+      }
+    })),
+  )
+}
+
 pub async fn dispatch_worker_handler(
   Path(worker_id): Path<String>,
-  Json(payload): Json<serde_json::Value>,
+  payload: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+  let Json(payload) = match payload {
+    Ok(payload) => payload,
+    Err(rejection) => {
+      let (code, message) = match &rejection {
+        JsonRejection::JsonDataError(_) => (
+          "DISPATCH_REQUEST_INVALID",
+          "Dispatch JSON validation failed".to_string(),
+        ),
+        JsonRejection::JsonSyntaxError(_) => (
+          "DISPATCH_JSON_INVALID",
+          "Dispatch body is not valid JSON".to_string(),
+        ),
+        JsonRejection::MissingJsonContentType(_) => (
+          "DISPATCH_CONTENT_TYPE_INVALID",
+          "Dispatch request must use Content-Type application/json".to_string(),
+        ),
+        JsonRejection::BytesRejection(_) => (
+          "DISPATCH_REQUEST_INVALID",
+          "Dispatch body could not be read".to_string(),
+        ),
+        _ => (
+          "DISPATCH_REQUEST_INVALID",
+          "Dispatch request could not be decoded".to_string(),
+        ),
+      };
+      log::warn!(
+        "[dispatch-phase] phase=DISPATCH_JSON_REJECTED worker_id={} code={} message={}",
+        worker_id,
+        code,
+        message
+      );
+      return Err(dispatch_json_error_response(code, message));
+    }
+  };
+  log::info!(
+    "[dispatch-phase] phase=DISPATCH_JSON_PARSED worker_id={} request_id={} profile_id={}",
+    worker_id,
+    payload
+      .get("requestId")
+      .and_then(|v| v.as_str())
+      .unwrap_or("<missing>"),
+    payload
+      .get("profileId")
+      .and_then(|v| v.as_str())
+      .unwrap_or("<missing>")
+  );
   // 1. Protocol version validation
   let proto = payload
     .get("protocol")
@@ -1823,4 +2015,58 @@ fn map_legacy_dispatch_error(error: WorkerError) -> (StatusCode, Json<serde_json
     StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
   let code = error.code_str().to_string();
   provider_error(&code, error.message, status)
+}
+
+#[cfg(test)]
+mod dispatch_json_tests {
+  use super::dispatch_json_error_response;
+  use axum::response::IntoResponse;
+  use http_body_util::BodyExt;
+
+  #[tokio::test]
+  async fn utf8_bom_json_is_rejected_with_machine_readable_envelope() {
+    let body = "\u{feff}{\"protocol\":\"floword-production\"}";
+    assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
+    let response =
+      dispatch_json_error_response("DISPATCH_JSON_INVALID", "Dispatch body is not valid JSON")
+        .1
+        .into_response();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "DISPATCH_JSON_INVALID");
+    assert_eq!(value["error"]["retryable"], false);
+  }
+
+  #[tokio::test]
+  async fn malformed_json_returns_json_error_envelope() {
+    assert!(serde_json::from_str::<serde_json::Value>("{broken").is_err());
+    let (_, json) =
+      dispatch_json_error_response("DISPATCH_JSON_INVALID", "Dispatch body is not valid JSON");
+    assert_eq!(json.0["protocol"], "floword-production");
+    assert_eq!(json.0["protocolVersion"], 1);
+    assert_eq!(json.0["error"]["details"]["phase"], "json_extraction");
+  }
+
+  #[test]
+  fn missing_content_type_is_classified_without_echoing_request_data() {
+    let (_, json) = dispatch_json_error_response(
+      "DISPATCH_CONTENT_TYPE_INVALID",
+      "Dispatch request must use Content-Type application/json",
+    );
+    let serialized = serde_json::to_string(&json.0).unwrap();
+    assert!(serialized.contains("DISPATCH_CONTENT_TYPE_INVALID"));
+    assert!(!serialized.contains("prompt"));
+    assert!(!serialized.contains("base64"));
+    assert!(!serialized.contains("token"));
+  }
+
+  #[test]
+  fn valid_no_bom_payload_remains_parseable_and_reaches_handler_contract() {
+    let payload = serde_json::from_str::<serde_json::Value>(
+      "{\"protocol\":\"floword-production\",\"protocolVersion\":1}",
+    )
+    .unwrap();
+    assert_eq!(payload["protocol"], "floword-production");
+    assert_eq!(payload["protocolVersion"], 1);
+  }
 }

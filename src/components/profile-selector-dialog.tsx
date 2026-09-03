@@ -213,6 +213,7 @@ export function ProfileSelectorDialog({
                   {profiles.map((profile) => {
                     const isRunning = runningProfiles.has(profile.id);
                     const canUseForLinks =
+                      !profile.legacy_unsupported &&
                       browserState.canUseProfileForLinks(profile);
                     const tooltipContent = getProfileTooltipContent(profile);
 
@@ -248,7 +249,9 @@ export function ProfileSelectorDialog({
                                   </div>
                                 </div>
                                 <Badge variant="secondary" className="text-xs">
-                                  {getBrowserDisplayName(profile.browser)}
+                                  {profile.legacy_unsupported
+                                    ? "Legacy unsupported"
+                                    : getBrowserDisplayName(profile.browser)}
                                 </Badge>
                                 {hasProxy(profile) && (
                                   <Badge variant="outline" className="text-xs">

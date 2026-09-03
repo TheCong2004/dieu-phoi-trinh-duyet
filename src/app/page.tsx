@@ -25,7 +25,6 @@ import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialo
 import { DeviceCodeVerifyDialog } from "@/components/device-code-verify-dialog";
 import { ExtensionGroupAssignmentDialog } from "@/components/extension-group-assignment-dialog";
 import { ExtensionManagementDialog } from "@/components/extension-management-dialog";
-import { FlowisePage } from "@/components/flowise-page";
 import { FlowiseTasksPage } from "@/components/flowise-tasks-page";
 import { CapCutPolotPage } from "@/components/capcutpolot-page";
 import { GroupAssignmentDialog } from "@/components/group-assignment-dialog";
@@ -33,6 +32,7 @@ import { GroupManagementDialog } from "@/components/group-management-dialog";
 import HomeHeader from "@/components/home-header";
 import { ImportProfileDialog } from "@/components/import-profile-dialog";
 import { IntegrationsDialog } from "@/components/integrations-dialog";
+import { LocalBrowserManager } from "@/components/local-browser-manager";
 import { ONBOARDING_TOUR } from "@/components/onboarding-provider";
 import { PermissionDialog } from "@/components/permission-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
@@ -91,7 +91,7 @@ import {
 } from "@/lib/toast-utils";
 import type { BrowserProfile, SyncSettings, WayfernConfig } from "@/types";
 
-type BrowserTypeString = "wayfern";
+type BrowserTypeString = "wayfern" | "chromium";
 
 interface PendingUrl {
   id: string;
@@ -252,10 +252,10 @@ export default function Home() {
   // Cloud auth for cross-OS unlock
   const { user: cloudUser } = useCloudAuth();
   const crossOsUnlocked = getEntitlements(cloudUser).crossOsFingerprints;
-  // Bulk run/stop is a paid (browser automation) feature, matching the
-  // /v1/profiles/batch/run API gate. Free/starter users see the bulk Run/Stop
-  // actions disabled with a Pro badge.
-  const automationUnlocked = getEntitlements(cloudUser).browserAutomation;
+  // Local Free owns browser automation; bulk actions do not require a
+  // subscription entitlement. Cloud account state remains available for
+  // legacy account/sync features, but never gates the local CFT runtime.
+  const automationUnlocked = true;
 
   const [selfHostedSyncConfigured, setSelfHostedSyncConfigured] =
     useState(false);
@@ -418,7 +418,6 @@ export default function Home() {
       case "shortcuts":
         // Plain page render — nothing else to open.
         break;
-      case "chatflows":
       case "tasks":
         break;
     }
@@ -930,24 +929,11 @@ export default function Home() {
         }
       }
 
-      // Show one-time warning about window resizing for fingerprinted browsers
-      if (profile.browser === "wayfern") {
-        try {
-          const dismissed = await invoke<boolean>(
-            "get_window_resize_warning_dismissed",
-          );
-          if (!dismissed) {
-            const proceed = await new Promise<boolean>((resolve) => {
-              windowResizeWarningResolver.current = resolve;
-              setWindowResizeWarningOpen(true);
-            });
-            if (!proceed) {
-              return;
-            }
-          }
-        } catch (error) {
-          console.error("Failed to check window resize warning:", error);
-        }
+      // Legacy Wayfern records remain available for export/archive, but are
+      // intentionally not launchable in Local Free mode.
+      if (profile.browser === "wayfern" || profile.legacy_unsupported) {
+        showErrorToast("LEGACY_UNSUPPORTED: create a Chrome for Testing profile");
+        return;
       }
 
       try {
@@ -1651,6 +1637,7 @@ export default function Home() {
               transition={{ duration: 0.25, ease: MOTION_EASE_OUT }}
               className="flex min-h-0 flex-1 flex-col px-3 pt-2.5"
             >
+              <LocalBrowserManager />
               <ProfilesDataTable
                 isLoading={isLoading && profiles.length === 0}
                 showOnboardingEmptyState={profiles.length === 0}
@@ -1713,12 +1700,6 @@ export default function Home() {
             >
               <ShortcutsPage groupTargets={orderedGroupTargets} />
             </motion.div>
-          )}
-
-          {currentPage === "chatflows" && (
-            <div className="min-h-0 flex-1">
-              <FlowisePage title={t("pageTitle.chatflows")} />
-            </div>
           )}
 
           {currentPage === "tasks" && <FlowiseTasksPage />}
